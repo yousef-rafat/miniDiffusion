@@ -2,8 +2,15 @@ import os
 import torch
 import torch.nn as nn
 import torchvision.io as io
-from torch.utils.data import Dataset
 from model.noise import NoiseScheduler 
+import torchvision.transforms.v2 as v2
+from torch.utils.data import Dataset, DataLoader
+
+effects = v2.Compose([
+    v2.RandomRotation(degrees=(0, 60)),
+    v2.RandomHorizontalFlip(),
+    v2.RandomPerspective(distortion_scale = 0.4, p = 0.6)
+])
 
 class OptimizeImage(nn.Module):
     " optimizes an image and makes it trainable "
@@ -28,7 +35,7 @@ class ImageDataset(Dataset):
     
     def __getitem__(self, idx):
         # in the forward pass of the model
-        # we compare both the distributions of noise and image
+        # we compare both the distributions of noise and image (returned values)
 
         image_dir = self.images[idx]
         image = io.read_image(image_dir)
@@ -45,3 +52,16 @@ class ImageDataset(Dataset):
 
         return image, noise
     
+def get_dataset(path: str, batch_size: int, shuffle: bool = True) -> DataLoader:
+    " Get dataset ready "
+    dataset = ImageDataset(path, transforms = effects)
+    dataloader = DataLoader(dataset, shuffle = shuffle, batch_size = batch_size)
+
+    return dataloader
+
+def get_fashion_mnist_dataset(batch_size: int = 32, shuffle: bool = True) -> DataLoader:
+
+    train_dataset = torchvision.datasets.FashionMNIST(root = "./data", train = True, download = True, transform = effects)
+    train_dataset = DataLoader(train_dataset, shuffle = shuffle, batch_size = batch_size)
+
+    return train_dataset

@@ -5,7 +5,7 @@ from dit_components import patchify, depatchify, RotaryPositionalEncoding
 
 class DiTBlock(nn.Module):
     # reference for rectified flow: https://arxiv.org/pdf/2403.03206
-    def __init__(self, heads: int, embedding_size: int, size: int = 16, depth: int = 5):
+    def __init__(self, heads: int, embedding_size: int = 512, patch_size: int = 16, depth: int = 5, max_length: int = 1024):
         super(DiTBlock, self).__init__()
 
         #####################
@@ -17,23 +17,29 @@ class DiTBlock(nn.Module):
             [PagedTransformerEncoderLayer(heads, embedding_size) for _ in range(depth)]
         )
 
-        self.size = size
+        self.p_size = patch_size
         vocab_size = 50261
 
         self.token_embedding = nn.Embedding(vocab_size, embedding_size)
 
         self.time_mlp = nn.Sequential([
-            RotaryPositionalEncoding(embedding_size, 1024),
+            RotaryPositionalEncoding(embedding_size, max_length),
             nn.Linear(embedding_size, embedding_size * 2),
             nn.GELU(),
             nn.Linear(embedding_size * 2, embedding_size),
             nn.GELU()
         ])
+
+        self.linear_patches = nn.Linear(patch_size, embedding_size)
     
     def forward(self, latent: torch.Tensor, t: torch.Tensor, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+
+        " Goal: Given Space, Time, and Conditioned Prompt, Return Velocity Vector "
+
         # t = current_time [0, 1]
 
-        patches = patchify(latent, size = self.size)
+        patches = patchify(latent, size = self.p_size)
+        patches = self.linear_patches(patches)
 
         # create time based embeddings
         time_embeddings = self.time_mlp(patches)
@@ -48,16 +54,20 @@ class DiTBlock(nn.Module):
         time_embeddings = torch.cat([zeros_text, time_embeddings])
 
         # make sure t has the correct shape
-        t = t.expand(x.size(0), 1)
-        x = torch.cat([x, t], dim = 1)
+        # (batch_size, seq_len + num_patches, 1)
+        t = t.unsqueeze(1).expand(-1, x.size(1), -1) # broadcast
 
-        x = time_embeddings + x
+        x = x + time_embeddings + t
 
-        src_key_padding_mask = ~attention_mask.bool()
+        # adjust attention mask to handle image patches
+        # (batch_size, num_patches + seq_len)
+        full_attention_mask = torch.cat([attention_mask, torch.ones(input_ids.size(0), patches.size(1), device = attention_mask.device)])
+
+        src_key_padding_mask = ~full_attention_mask.bool()
 
         # pass attention mask for every layer
         for layer in self.model:
-            x = layer(x, src_key_padding_mask=src_key_padding_mask)
+            x = layer(x, src_key_padding_mask = src_key_padding_mask)
 
         # remove text processing from image
         x = x[:, attention_mask.size(1):, :]

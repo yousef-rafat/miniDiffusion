@@ -1,12 +1,24 @@
+import os
 import torch
+import torchvision
 import torch.nn as nn
-import torch.functional as F
+import torch.nn.functional as F
+from torchvision.models import Inception_V3_Weights
 
 class FID(nn.Module):
     # reference equation: https://www.oreilly.com/library/view/generative-adversarial-networks/9781789136678/9bf2e543-8251-409e-a811-77e55d0dc021.xhtml
     def __init__(self):
         super(FID, self).__init__()
-        self.model = torch.hub.load('pytorch/vision:v0.10.0', 'inception_v3', pretrained = True)
+
+        os.environ['TORCH_HOME'] = os.path.join(os.getcwd(), "encoders")
+
+        model_path = os.path.join(os.getcwd(), "encoders", "hub", "checkpoints", "inception_v3_google-0cc3c7bd.pth")
+
+        if not os.path.exists(model_path): self.model = torchvision.models.inception_v3(weights = Inception_V3_Weights.IMAGENET1K_V1)
+        else: 
+            # initate model and load state
+            self.model = torchvision.models.inception_v3(init_weights = False)
+            self.model.load_state_dict(torch.load(model_path))
 
         # perform no operation and return the features
         self.model.fc = nn.Identity()
@@ -40,8 +52,10 @@ class FID(nn.Module):
         mu_gen = torch.mean(gen_features, dim = 0)
         mu_rl = torch.mean(rl_features, dim = 0)
 
-        sigma_gen = torch.cov(gen_features)
-        sigma_rl = torch.cov(rl_features)
+        # covariance matrices
+        # avoid outputing scalars (0D)
+        sigma_gen = torch.cov(gen_features.T) if gen_features.shape[0] > 1 else torch.eye(gen_features.shape[1])
+        sigma_rl = torch.cov(rl_features.T) if rl_features.shape[0] > 1 else torch.eye(rl_features.shape[1])
 
         # compute square difference
         diff = mu_rl - mu_gen
@@ -52,3 +66,11 @@ class FID(nn.Module):
         fid_score = mu_diff + torch.trace(sigma_gen + sigma_rl - 2 * covmean)
 
         return fid_score
+    
+def test_fid():
+    gen_img = torch.rand(3, 224, 224)
+    img = torch.rand(3, 224, 224)
+
+    fid = FID()
+    score = fid(gen_img.unsqueeze(0), img.unsqueeze(0))
+    print(score)

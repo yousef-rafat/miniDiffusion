@@ -1,9 +1,7 @@
-import os
-import json
 import torch
 import torch.nn as nn
-from clip import CLIP
 from torch import Tensor
+from tokenizer import TorchTokenizer
 
 def patchify(x: Tensor, size: int, stride: int):
     " Turn a latent into patches "
@@ -38,58 +36,7 @@ def depatchify(x: Tensor, img_size: int) -> torch.Tensor:
     x = x.view(batch, channels, img_size, img_size) 
 
     return x
-
-class TorchTokenizer:
-    # TODO: add special tokens to tokenizer and remove detokenizer
-    def __init__(self, tokenizer_path="tokenizer.json"):
-        # Load the tokenizer.json file
-        file_path = os.path.join(os.getcwd(), "src", "model", tokenizer_path)
-
-        with open(file_path, "r", encoding="utf-8") as f:
-            tokenizer_data = json.load(f)
         
-        # Extract vocabulary
-        self.vocab = tokenizer_data["model"]["vocab"]
-        # For detokenization
-        self.inv_vocab = {v: k for k, v in self.vocab.items()}
-
-        self.vocab_len = len(self.vocab)
-        self.special_vocab = { '<pad>': self.vocab_len + 1, '<start>': self.vocab_len + 2, '<end>': self.vocab_len + 3, '<unk>': self.vocab_len + 4 }
-
-        self.start = self.special_vocab['<start>']
-        self.end = self.special_vocab['<end>']
-        self.pad_id = self.special_vocab['<pad>']
-
-        self.unk_token = self.special_vocab['<unk>']
-
-    def tokenize(self, text):
-        """Tokenizes text by splitting on whitespace and maps to vocab."""
-        # split by white space
-        tokens = text.lower().split()
-        token_ids = [self.vocab.get(token, self.unk_token) for token in tokens]
-        return torch.tensor(token_ids, dtype=torch.long)
-
-    def detokenize(self, token_ids, skip_special_tokens = True):
-        """Converts token IDs back to text."""
-        tokens = [self.inv_vocab.get(id, self.unk_token) for id in token_ids]
-        return " ".join(tokens)
-
-    def pad_sequence(self, token_ids, max_length):
-        """Pads tokenized sequences to a fixed length."""
-        pad_length = max_length - len(token_ids)
-        if pad_length > 0:
-            token_ids = torch.cat([token_ids, torch.full((pad_length,), self.pad_id, dtype=torch.long)])
-        return token_ids[:max_length]
-
-# Example usage
-tokenizer = TorchTokenizer()
-text = "hello world"
-token_ids = tokenizer.tokenize(text)
-
-print("Tokenized:", token_ids) 
-print("Detokenized:", tokenizer.detokenize(token_ids.tolist()))
-        
-
 class ConditionalPromptNorm(nn.Module):
     # normalization with Feed-Forward layer for text prompts
     # should be encoded with clip

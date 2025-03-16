@@ -27,9 +27,17 @@ class PagedAttention(nn.Module):
         # KV Cache Storage (Paged)
         self.kv_cache = []  # Stores (K, V) pages
 
-    def forward(self, x: torch.Tensor, use_cache: bool = True):
+    # key and value equal None to compliy with PyTorch's api
+    def forward(self, x: torch.Tensor, key = None, value = None, attn_mask = None, use_cache: bool = True, key_padding_mask: torch.Tensor = None, **kwargs):
         # reference attention equation
         # https://pbs.twimg.com/profile_images/1624054272676532224/UNv4ONME_400x400.jpg
+
+        if key is None: key = x
+        if value is None: value = x
+
+        # handle padding tokens
+        if key_padding_mask is not None:
+            x = x.masked_fill(key_padding_mask.unsqueeze(-1) == 1, 0) 
 
         batch_size, seq_length, _ = x.size()
 
@@ -52,6 +60,11 @@ class PagedAttention(nn.Module):
 
         # compute attention, reference above
         scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.head_dim ** 0.5)
+
+        # check if attention scores are valid
+        if attn_mask is not None:
+            scores = scores.masked_fill(attn_mask == 0, float("-inf"))
+        
         attention = torch.softmax(scores, dim = -1)
 
         attention = self.dropout_layer(attention)
@@ -92,12 +105,20 @@ class PagedAttention(nn.Module):
         self.kv_cache = []
 
     def __del__(self):
-        super().__del__()
+        super()
         self.reset_cache()
 
 class PagedTransformerEncoderLayer(nn.TransformerEncoderLayer):
     " Transformer Encoder Layer with Paged Attention "
-    def __init__(self, embed_dim, num_heads, dropout = 0.1):
-        super().__init__(embed_dim, num_heads, dropout)
-        self.self_attn = PagedAttention(embed_dim, num_heads, dropout = dropout)
+    def __init__(self, embed_dim, num_heads, dim_feedforward: int = 2048, dropout = 0.1):
+        # dim_feedforward = number of hidden features in FFN
+        super().__init__(embed_dim, num_heads, dim_feedforward, dropout)
+        self.self_attn = PagedAttention(heads = num_heads, embedding_size = embed_dim, dropout = dropout)
 
+def test_atten(embed_dim = 512):
+    x = torch.rand(1024, embed_dim)
+    key_padding_mask = torch.zeros(1, 1024) 
+    model = PagedTransformerEncoderLayer(embed_dim = embed_dim, num_heads = 8)
+    output = model(x.unsqueeze(0), src_key_padding_mask = key_padding_mask)
+    print(output)
+    del model
