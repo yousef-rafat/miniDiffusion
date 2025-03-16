@@ -4,12 +4,14 @@ import torch.nn as nn
 import torchvision.io as io
 from model.noise import NoiseScheduler 
 import torchvision.transforms.v2 as v2
+from torchvision.transforms import ToTensor
 from torch.utils.data import Dataset, DataLoader
 
 effects = v2.Compose([
     v2.RandomRotation(degrees=(0, 60)),
     v2.RandomHorizontalFlip(),
-    v2.RandomPerspective(distortion_scale = 0.4, p = 0.6)
+    v2.RandomPerspective(distortion_scale = 0.4, p = 0.6),
+    ToTensor()
 ])
 
 class OptimizeImage(nn.Module):
