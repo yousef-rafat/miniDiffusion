@@ -29,12 +29,14 @@ class NoiseScheduler(torch.nn.Module):
         # returns timesteps in range [0, timesteps - 1]
         # beneficial to train the model on different noise levels
 
-        normal_samples = torch.randn(batch_size, device = device) * self.sigma + self.mu
+        uniform_samples = torch.rand(batch_size, device = device)
+        # turn a uniform sample into a normal sample
+        normal_samples = torch.logit(uniform_samples, eps = 1e-8) * self.sigma + self.mu
 
-        sampled_t = nn.Sigmoid()(normal_samples)
+        sampled_t = torch.sigmoid(normal_samples)
 
         weighted_sampled_t = (sampled_t * (self.timesteps - 1)).long() # scale
-
+        
         return weighted_sampled_t
         
 
@@ -55,7 +57,6 @@ class NoiseScheduler(torch.nn.Module):
         # rand_like will use uniform random numbers to generate noise
         # that will fit the image's dimensions
         noise = torch.rand_like(image.float())
-        
         noised_image = torch.sqrt(self.alpha_bar[timestep]) * image + noise * torch.sqrt(1 - self.alpha_bar[timestep])
 
         # returning noise is helpful for training
@@ -139,5 +140,3 @@ def test_noise():
 
     print(noised_image)
     # TODO: save image and check noise
-
-test_noise()
