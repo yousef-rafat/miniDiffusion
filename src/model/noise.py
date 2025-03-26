@@ -137,6 +137,6 @@ def test_noise():
     
     noiser = NoiseScheduler(0.9, 10)
     noised_image, _ = noiser.add_noise(image = image.unsqueeze(0))
-
+    
     print(noised_image)
     # TODO: save image and check noise

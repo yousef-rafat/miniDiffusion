@@ -37,7 +37,10 @@ class PagedAttention(nn.Module):
 
         # handle padding tokens
         if key_padding_mask is not None:
-            x = x.masked_fill(key_padding_mask.unsqueeze(-1) == 1, 0) 
+            # handle cases where broadcasting is and isn't needed
+            try: x = x.masked_fill(key_padding_mask.unsqueeze(-1) == 1, 0).float()
+            except RuntimeError:
+                x = x.masked_fill(key_padding_mask == 1, 0).float()
 
         batch_size, seq_length, _ = x.size()
 

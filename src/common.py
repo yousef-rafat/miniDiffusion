@@ -38,6 +38,8 @@ def compute_clip_loss(clip, generated_image, input_ids, attention_mask):
 
     # get logits
     logits = clip(generated_image, input_ids, attention_mask)
+
+    if logits.size(0) < 2: raise ValueError("clip loss requires at least two samples in batch")
     
     labels = torch.arange(logits.size(0), device = logits.device)
 

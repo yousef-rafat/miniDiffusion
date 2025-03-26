@@ -1,5 +1,6 @@
 import os
 import torch
+import torchvision
 import torch.nn as nn
 import torchvision.io as io
 from model.noise import NoiseScheduler 

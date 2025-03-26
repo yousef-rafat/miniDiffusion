@@ -3,7 +3,7 @@ import torch.nn as nn
 
 class VAE(nn.Module):
     # Create the variational autoencoder
-    def __init__(self, input_channels=3, latent_dim = 128, depth = 4, size = 28):
+    def __init__(self, input_channels = 3, depth = 4, size = 14):
         """
         Args:
             input_channels (int): Number of channels in the input image (e.g., 3 for RGB).
@@ -12,8 +12,6 @@ class VAE(nn.Module):
         """
         # the goal of the code is to get the encoder and the decoder models with some helpful layers
         super(VAE, self).__init__()
-        self.latent_dim = latent_dim
-        self.depth = depth
         self.size = size
 
         # ////////////////////
@@ -34,9 +32,10 @@ class VAE(nn.Module):
         # turn the layers into a model
         self.encoder_model = nn.Sequential(*encoder_layers)
 
-        # linear layers for varianece and mean
-        self.fc_mu  = nn.Linear(in_channels * 4 * 4, latent_dim) # mean
-        self.fc_var = nn.Linear(in_channels * 4 * 4, latent_dim) # variance
+        # conv layers for varianece and mean
+        # use conv to keep the spaial dimensions
+        self.fc_mu  = nn.Conv2d(in_channels, 4, kernel_size = 3, stride = 1, padding = 1) # mean
+        self.fc_var = nn.Conv2d(in_channels, 4, kernel_size = 3, stride = 1, padding = 1) # variance
 
         # adaptive average pooling to allow any input size for the images
         self.avg_pool = nn.AdaptiveAvgPool2d((size, size)) # ensure fixed size before passing
@@ -45,21 +44,24 @@ class VAE(nn.Module):
         self.final_channels = in_channels
 
         # layer for decoding the latents
-        self.fc_decode = nn.Linear(latent_dim, in_channels * 4 * 4)
+        #self.fc_decode = nn.Linear(4 * 28 * 28, 200704)
+        self.fc_decode = nn.Linear(4 * size * size, self.final_channels * size * size)
 
         # ////////////////////
         # Building the Decoder
         # ///////////////////
         
         decoder_layers = []
-
+        # latent dimension
+        in_channels = self.final_channels
         # Create sample of up block each decreasing the depth by 2
 
         for i in range(depth):
             # reverse the channel doubling that happened in encoding
             output_channels = in_channels // 2
             decoder_layers.append(
-                nn.ConvTranspose2d(in_channels, output_channels)
+                # stride = 2 for increasing the dimensions of the image
+                nn.ConvTranspose2d(in_channels, output_channels, kernel_size = 3, stride = 2, padding = 1, output_padding = 1)
             )
             # add batch norm and relu to better the vae decoder
             decoder_layers.append(nn.BatchNorm2d(output_channels))
@@ -68,7 +70,7 @@ class VAE(nn.Module):
             in_channels = output_channels
 
         # last layer to get the image to the original number of channels
-        decoder_layers.append(nn.Conv2d(in_channels, input_channels))
+        decoder_layers.append(nn.Conv2d(in_channels, input_channels, kernel_size = 3))
 
         # we will add a sigmoid layer to ensure our output is between 0-1
         # without the sigmoid, the model will have to learn that the output is between 0 and 1
@@ -80,7 +82,7 @@ class VAE(nn.Module):
 
     def reparam_trick(self, mean: torch.Tensor, logvar: torch.Tensor):
         " Applied the reparamterization trick "
-        std = torch.exp(logvar * 0.5)
+        std = torch.exp(0.5 * logvar)
         eps = torch.rand_like(std)
 
         return mean + eps * std
@@ -93,18 +95,24 @@ class VAE(nn.Module):
         """
 
         # function to encode image
-        x = self.encoder_model(image)
+        x = self.encoder_model(image.float())
         x = self.avg_pool(x) # get fixed size
-        x = nn.Flatten(x)
 
         mean_u = self.fc_mu(x)
         logvar = self.fc_var(x)
 
-        return mean_u, logvar
+        latent = self.reparam_trick(mean = mean_u, logvar = logvar)
+
+        return mean_u, logvar, latent
 
     def decode(self, latent: torch.Tensor):
         " decodes a latent "
-        x = self.fc_decode(latent)
+
+        # avoid flattening batch size
+        x = torch.flatten(latent, start_dim = 1)
+
+        x = self.fc_decode(x)
+
         batch_size = latent.size(0)
 
         x = x.reshape(batch_size, self.final_channels, self.size, self.size)
@@ -123,3 +131,15 @@ def load_vae(model: VAE, path: str, device: str = "cpu") -> VAE:
     model.eval()
 
     return model
+
+def test_vae():
+
+    vae = VAE()
+
+    image = torch.randn(1, 3, 224, 224)
+
+    _, _, latent = vae.encode(image)
+
+    image = vae.decode(latent = latent)
+    print(image.size())
+    print("Image: ", image)

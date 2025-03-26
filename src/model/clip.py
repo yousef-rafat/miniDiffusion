@@ -2,27 +2,30 @@ import os
 import torch
 import torchvision
 import torch.nn as nn
-from dit_components import patchify
+import torch.nn.functional as F
 from torchvision.models import ViT_B_16_Weights
 from attention import PagedTransformerEncoderLayer
 
 class TextEncoder(nn.Module):
-    def __init__(self, project_dim, embed_dim):
+    def __init__(self, project_dim, embed_dim: int = 512, heads: int = 8, depth: int = 5):
         super(TextEncoder, self).__init__()
 
         from tokenizer import TorchTokenizer # avoid circular import error
 
-        self.model = PagedTransformerEncoderLayer(embed_dim = 512, num_heads = 8)
+        self.model = nn.ModuleList(
+            [PagedTransformerEncoderLayer(num_heads = heads, embed_dim =  embed_dim) for _ in range(depth)]
+        )
 
         self.tokenizer = TorchTokenizer()
 
         self.projection = nn.Linear(embed_dim, project_dim)
         self.layer_norm = nn.LayerNorm(project_dim)
 
-    def forward(self, input_ids: torch.Tensor, attention_mask: torch.Tensor):
+    def forward(self, x: torch.Tensor, attention_mask: torch.Tensor):
 
         # obtain text embeddings
-        x = self.model(input_ids, src_key_padding_mask = (attention_mask == 0) )
+        for layer in self.model:
+            x = layer(x, src_key_padding_mask = (attention_mask == 0).float())
 
         # get classification token
         x = x[:, 0, :]
@@ -30,9 +33,6 @@ class TextEncoder(nn.Module):
         x = self.projection(x)
 
         return self.layer_norm(x)
-    
-    def encoder_tokenize(self, prompt: str):
-        return self.tokenizer(prompt, padding = True, truncation = True, max_length = 1024)
 
 class ImageEncoder(nn.Module):
     def __init__(self, project_dim, size: int = 16):
@@ -40,19 +40,18 @@ class ImageEncoder(nn.Module):
 
         model_path = os.path.join(os.getcwd(), "encoders", "hub", "checkpoints", "vit_b_16_lc_swag-4e70ced5.pth")
 
-        if not os.path.exists(model_path): self.model = torchvision.models.vit_b_16(weights = ViT_B_16_Weights.IMAGENET1K_SWAG_LINEAR_V1)
+        if os.path.exists(model_path): 
+            self.model = torchvision.models.vit_b_16(weights = ViT_B_16_Weights.IMAGENET1K_SWAG_LINEAR_V1)
         else: 
             # initate model and load state
             self.model = torchvision.models.vit_b_16()
             self.model.load_state_dict(torch.load(model_path))
 
-        self.projection = nn.Linear(self.model.hidden_dim, project_dim)
+        self.projection = nn.Linear(1000, project_dim)
         self.layer_norm = nn.LayerNorm(project_dim)
         self.size = size
 
     def forward(self, x: torch.Tensor):
-
-        x = patchify(x, size = self.size, stride = self.size)
 
         x = self.model(x)
         x = self.projection(x)
@@ -74,8 +73,8 @@ class CLIP(nn.Module):
 
         " Compute the relationship between image and text  "
 
-        image_features = self.image_encoder(image)
-        text_features = self.text_encoder(input_ids, attention_mask)
+        image_features = F.normalize(self.image_encoder(image), dim = -1)
+        text_features = F.normalize(self.text_encoder(input_ids, attention_mask), dim = -1)
 
         image_features = image_features / image_features.norm(dim = -1, keepdim = True)
         text_features = text_features / text_features.norm(dim = -1, keepdim = True)        
@@ -92,7 +91,7 @@ def test_clip(mask = True):
 
     if mask: attn_mask = torch.zeros(1024, 512)
 
-    outputs = model(image = image.unsqueeze(0), input_ids = input_ids, attention_mask = attn_mask)
-    print(outputs)
+    outputs = model(image = image.unsqueeze(0), input_ids = input_ids.unsqueeze(0), attention_mask = attn_mask.unsqueeze(0))
+    print("output: ", outputs)
 
 test_clip()
