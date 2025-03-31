@@ -1,6 +1,7 @@
 import os
 import json
 import torch
+from itertools import takewhile
 
 class TorchTokenizer:
     def __init__(self, tokenizer_path="tokenizer.json"):
@@ -27,11 +28,12 @@ class TorchTokenizer:
 
         self.unk_token = self.special_vocab['<unk>']
 
-    def tokenize(self, text, max_length: int = 1024):
+    def tokenize(self, text, max_length: int = 512):
         """Tokenizes text by splitting on whitespace and maps to vocab."""
         # split by white space
         tokens = text.lower().split()
         token_ids = [self.vocab.get(token, self.unk_token) for token in tokens]
+        attention_mask = torch.ones(max_length)
 
         # truncate
         if len(token_ids) < max_length - 2:
@@ -46,13 +48,15 @@ class TorchTokenizer:
         # pad the rest
         while len(token_ids) < max_length:
             token_ids.append(self.pad_id)
+            attention_mask[len(token_ids) - 1] = 0
 
-        return torch.tensor(token_ids, dtype = torch.long)
+        return torch.tensor(token_ids, dtype = torch.long), attention_mask.long()
 
     def detokenize(self, token_ids, skip_special_tokens = True):
         """Converts token IDs back to text."""
         
-        tokens = [self.inv_vocab.get(id, self.unk_token) for id in token_ids]
+        #                                                          skip pad tokens
+        tokens = [self.inv_vocab.get(id, self.unk_token) for id in takewhile(lambda x: x != self.pad_id, token_ids)]
 
         if skip_special_tokens:
             special_tokens = set(self.special_vocab.keys())

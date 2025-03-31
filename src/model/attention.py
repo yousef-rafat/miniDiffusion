@@ -13,6 +13,9 @@ class PagedAttention(nn.Module):
         self.page_size = page_size
         self.max_pages = max_pages
 
+        # avoid error
+        self.batch_first = False
+
         assert embedding_size % heads == 0, "embedding size must be divisible by heads"
         self.head_dim = embedding_size // heads
 
@@ -62,7 +65,15 @@ class PagedAttention(nn.Module):
             K, V = new_K, new_V 
 
         # compute attention, reference above
-        scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        try: scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.head_dim ** 0.5)
+        except:
+            # infer correct seq_len after returning from cache
+            seq_length = K.shape[1] // self.heads
+
+            # reshape to correct sizes
+            K = K.view(batch_size, self.heads, seq_length, self.head_dim)
+            V = V.view(batch_size, self.heads, seq_length, self.head_dim)
+            scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.head_dim ** 0.5)
 
         # check if attention scores are valid
         if attn_mask is not None:
@@ -71,10 +82,10 @@ class PagedAttention(nn.Module):
         attention = torch.softmax(scores, dim = -1)
 
         attention = self.dropout_layer(attention)
-
         output = torch.matmul(attention, V)
 
         # (batch_size, seq_length, embedding_size)
+        seq_length = output.size(2)
         out = output.permute(0, 2, 1, 3).contiguous().view(batch_size, seq_length, self.embedding_size)
 
         return self.out_linear(out)

@@ -1,5 +1,4 @@
 import torch
-import torch.nn as nn
 from typing import Optional
 
 class NoiseScheduler(torch.nn.Module):
@@ -62,6 +61,7 @@ class NoiseScheduler(torch.nn.Module):
         # returning noise is helpful for training
         return noised_image, noise
     
+    @torch.no_grad()
     def euler_solver(self, model, x: torch.Tensor, dt: Optional[float], steps: int = 20, stochasticity: bool = True):
         " Implements Euler's ODE solver "
 
@@ -87,13 +87,13 @@ class NoiseScheduler(torch.nn.Module):
 
             # compute the RK4 increments
             # k1 = f(x, t)
-            k1 = self.reverse_flow(x, current_time, stochasticity = stochasticity)
+            k1 = self.reverse_flow(x, dt, current_time, stochasticity = stochasticity)
             # k2 = f(x + dt/2 * k1, t - dt/2)
-            k2 = self.reverse_flow(x + (dt / 2) * k1, current_time - dt / 2, stochasticity = stochasticity)
+            k2 = self.reverse_flow(x + (dt / 2) * k1, current_time - dt / 2, current_time = current_time, stochasticity = stochasticity)
             # k3 = f(x + dt/2 * k2, t - dt/2)
-            k3 = self.reverse_flow(x + (dt / 2) * k2, current_time - dt / 2, stochasticity = stochasticity)
+            k3 = self.reverse_flow(x + (dt / 2) * k2, current_time - dt / 2, current_time = current_time, stochasticity = stochasticity)
             # k4 = f(x + dt * k3, t - dt)
-            k4 = self.reverse_flow(x + dt * k3, current_time - dt, stochasticity = stochasticity)
+            k4 = self.reverse_flow(x + dt * k3, current_time - dt, current_time = current_time, stochasticity = stochasticity)
 
         dx = (dt / 6) * (k1 + 2 * k2 + 2 * k3 + k4)
 
@@ -103,21 +103,26 @@ class NoiseScheduler(torch.nn.Module):
     
     def reverse_flow(self, x: torch.Tensor, dt: float, current_time: float, stochasticity: bool):
 
+        """ Function to integerate the reverse process (eval mode) for a latent """
+
         # dt: timestep for integeration (a small positive number)
         # current_time: the time value in [0, 1], where 1 is pure noise and 0 is data
 
         # when current time is zero, the data has been reached
         if current_time <= 0:
             return x
+
+        current_time = torch.tensor([current_time], dtype = x.dtype, device = x.device)
         
         # velocity field v(x, t)
         with torch.no_grad():
-            x_prev = self.model(x, current_time)
+            x_prev = self.model.solve(x, current_time)
         
-        # TODO: check if this is valid
         # stochasticity helps in randomizing what the model generates (increases diversity)
         if stochasticity:
             noise = torch.randn_like(x)
+            # adjust dimensions to match the elementwise addition
+            x_prev = x_prev[:, :, :noise.size(-1), :noise.size(-1)]
             # scale the noise by sqrt(dt) so variance is proportional to dt.
             x_prev = x_prev + (torch.sqrt(torch.tensor(dt, device=x.device)) * noise)
 

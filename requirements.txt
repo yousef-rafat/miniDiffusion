@@ -1,2 +1,4 @@
+# matplotlib for visualizing only (optional)
 torch
 torchvision
+matplotlib

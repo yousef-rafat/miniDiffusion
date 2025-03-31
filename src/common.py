@@ -1,5 +1,6 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 
 ##################################
 # https://arxiv.org/pdf/2403.03206
@@ -14,18 +15,18 @@ def loss_fn(v_pred: torch.Tensor, v_true: torch.Tensor, alpha_t):
     # small value to avoid division by zero
     weight = (alpha_t / (beta_t + 1e-8))
 
+    v_pred = v_pred[:, :, :v_true.size(-1), :v_true.size(-1)]
+    
     loss = (weight * (v_pred - v_true) ** 2).mean()
 
     return loss
 
 def interpolate_samples(source, target, t):
-    # linearly interpolate samples
+    # linearly interpolate latents between noise and data
     return source * (1 - t) + target * t
 
-def get_ground_truth_velocity(image: torch.Tensor, noise: torch.Tensor, t,  alpha_t):
+def get_ground_truth_velocity(image: torch.Tensor, noise: torch.Tensor, alpha_t):
     # refer to reference papar above:
-
-    alpha_t = alpha_t[t]
 
     a_t = torch.sqrt(alpha_t)
     b_t = torch.sqrt(1 - alpha_t)
@@ -33,21 +34,34 @@ def get_ground_truth_velocity(image: torch.Tensor, noise: torch.Tensor, t,  alph
     v_t = (a_t * image + b_t * noise) / torch.sqrt(a_t**2 + b_t**2)
     return v_t
 
-def compute_clip_loss(clip, generated_image, input_ids, attention_mask):
+def compute_clip_loss(clip, generated_image, input_ids, attention_mask, size: int):
     " compute the contrasive loss between text and generated image "
+
+    # adjut image size (important in case of rounding dimensions in VAE)
+    clip.adjust_image_size(size)
 
     # get logits
     logits = clip(generated_image, input_ids, attention_mask)
 
     if logits.size(0) < 2: raise ValueError("clip loss requires at least two samples in batch")
     
-    labels = torch.arange(logits.size(0), device = logits.device)
+    labels = torch.arange(logits.size(0), device = logits.device).long()
 
     # compute the loss in two ways
-    loss_i2t = nn.CrossEntropy()(logits, labels) # image to text
-    loss_t2i = nn.CrossEntropy()(logits.t(), labels) # text to image
+    loss_i2t = nn.CrossEntropyLoss()(logits, labels) # image to text
+    loss_t2i = nn.CrossEntropyLoss()(logits.t(), labels) # text to image
 
     # average the two losses
     loss = (loss_i2t + loss_t2i) / 2
 
     return loss
+
+def test_clip_loss():
+    label = torch.rand(2, 512)
+    image = torch.rand(2, 3, 222, 222)
+    
+    from model.clip import CLIP
+    
+    loss = compute_clip_loss(clip = CLIP(),generated_image = image, input_ids = label, attention_mask = torch.zeros_like(label), size = image.size(-1))
+
+    print(loss)

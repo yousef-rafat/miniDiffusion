@@ -2,8 +2,9 @@ import math
 import torch
 import torch.nn as nn
 from torch import Tensor
+from model.clip import CLIP
 import torch.nn.functional as F
-from tokenizer import TorchTokenizer
+from model.tokenizer import TorchTokenizer
 
 def patchify(x: Tensor, size: int, stride = None):
     " Turn a latent into patches "
@@ -50,7 +51,7 @@ def depatchify(x: Tensor, img_size: int) -> torch.Tensor:
 class ConditionalPromptNorm(nn.Module):
     # normalization with Feed-Forward layer for text prompts
     # should be encoded with clip
-    def __init__(self, hidden_size, dim: int):
+    def __init__(self, hidden_size: int, dim: int):
         super(ConditionalPromptNorm, self).__init__()
 
         # normalization
@@ -114,17 +115,20 @@ class RotaryPositionalEncoding(nn.Module):
     
 class HandlePrompt(nn.Module):
     # be used in training with raw string data
-    def __init__(self):
+    def __init__(self, hidden_size: int = 512, dim: int = 512):
         super(HandlePrompt, self).__init__()
 
         self.tokenizer = TorchTokenizer()
-        self.norm = ConditionalPromptNorm()
+        self.norm = ConditionalPromptNorm(hidden_size = hidden_size, dim = dim)
+        self.clip = CLIP()
 
     def forward(self, prompt: str):
-        x = self.tokenizer.tokenize(prompt)
-        x = self.norm(x)
 
-        return x
+        x, attention_mask = self.tokenizer.tokenize(prompt)
+        features = self.clip.encode_text(x.unsqueeze(0))
+        x = self.norm(x.float(), features)
+
+        return x, attention_mask
     
 class FiLM(nn.Module):
     def __init__(self, cond_dim: int):
@@ -147,4 +151,5 @@ class FiLM(nn.Module):
         gamma, beta = torch.chunk(gamma_beta, chunks = 2, dim = -1)
 
         # unsqueeze to allow broadcasting
-        return gamma.unsqueeze(1) * x + beta.unsqueeze(1)
+        #return gamma.unsqueeze(1) * x + beta.unsqueeze(1)
+        return gamma * x + beta
