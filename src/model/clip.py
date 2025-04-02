@@ -94,7 +94,15 @@ class CLIP(nn.Module):
         " Compute the relationship between image and text  "
 
         image_features = F.normalize(self.image_encoder(image), dim = -1)
-        text_features = F.normalize(self.text_encoder(input_ids, attention_mask), dim = -1)
+
+        #if input_ids.dim() != 3: text_features = F.normalize(self.text_encoder(input_ids, attention_mask), dim = -1)
+        #else: 
+            # masked mean pooling so only non-padded tokens contribute
+
+        if input_ids.dim() == 4: input_ids = input_ids.squeeze(1)
+
+        text_features = input_ids.float() * attention_mask.unsqueeze(-1)
+        text_features = text_features.sum(dim = 1) / attention_mask.sum(dim = 1, keepdim = True)
 
         image_features = image_features / image_features.norm(dim = -1, keepdim = True)
         text_features = text_features / text_features.norm(dim = -1, keepdim = True)  
@@ -103,10 +111,9 @@ class CLIP(nn.Module):
 
         return logits
     
-    def encode_text(self, input_ids: torch.Tensor):
+    def encode_text(self, input_ids: torch.Tensor, attention_mask: torch.Tensor):
         """ Encodes tokens for ConditionalPromptNorm """
 
-        attention_mask = torch.zeros_like(input_ids)
         with torch.no_grad():
             text_embeddings = self.text_encoder(input_ids, attention_mask)
 

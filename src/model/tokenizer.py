@@ -4,7 +4,7 @@ import torch
 from itertools import takewhile
 
 class TorchTokenizer:
-    def __init__(self, tokenizer_path="tokenizer.json"):
+    def __init__(self, tokenizer_path: str = "tokenizer.json", max_length: int = 512):
 
         # Load the tokenizer.json file
         file_path = os.path.join(os.getcwd(), "src", "model", tokenizer_path)
@@ -12,6 +12,7 @@ class TorchTokenizer:
         with open(file_path, "r", encoding="utf-8") as f:
             tokenizer_data = json.load(f)
         
+        self.max_length = max_length
         # Extract vocabulary
         self.vocab = tokenizer_data["model"]["vocab"]
         # For detokenization
@@ -28,16 +29,16 @@ class TorchTokenizer:
 
         self.unk_token = self.special_vocab['<unk>']
 
-    def tokenize(self, text, max_length: int = 512):
+    def tokenize(self, text):
         """Tokenizes text by splitting on whitespace and maps to vocab."""
         # split by white space
         tokens = text.lower().split()
         token_ids = [self.vocab.get(token, self.unk_token) for token in tokens]
-        attention_mask = torch.ones(max_length)
+        attention_mask = torch.ones(self.max_length)
 
         # truncate
-        if len(token_ids) < max_length - 2:
-            token_ids = token_ids[:max_length - 2]
+        if len(token_ids) < self.max_length - 2:
+            token_ids = token_ids[:self.max_length - 2]
 
         # add starting token
         token_ids.insert(0, self.start)
@@ -46,7 +47,7 @@ class TorchTokenizer:
         token_ids.append(self.end)
 
         # pad the rest
-        while len(token_ids) < max_length:
+        while len(token_ids) < self.max_length:
             token_ids.append(self.pad_id)
             attention_mask[len(token_ids) - 1] = 0
 

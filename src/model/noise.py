@@ -62,7 +62,7 @@ class NoiseScheduler(torch.nn.Module):
         return noised_image, noise
     
     @torch.no_grad()
-    def euler_solver(self, model, x: torch.Tensor, dt: Optional[float], steps: int = 20, stochasticity: bool = True):
+    def euler_solver(self, model, x: torch.Tensor, dt: Optional[float], steps: int = 5, stochasticity: bool = True):
         " Implements Euler's ODE solver "
 
         if not dt: dt = 1 / steps
@@ -75,7 +75,7 @@ class NoiseScheduler(torch.nn.Module):
         return xt.cpu()
     
     @torch.no_grad()
-    def rk4_solver(self, model, x: torch.Tensor, dt: Optional[float] = None, steps: int = 20, stochasticity: bool = True):
+    def rk4_solver(self, model, x: torch.Tensor, dt: Optional[float] = None, steps: int = 4, stochasticity: bool = True):
         " 4th-order Runge-Kutta ODE solver "
 
         if not dt: dt = 1 / steps

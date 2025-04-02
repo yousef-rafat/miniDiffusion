@@ -3,7 +3,7 @@ import torch.nn as nn
 
 class VAE(nn.Module):
     # Create the variational autoencoder
-    def __init__(self, input_channels = 3, latent_dim = 4, depth = 5, latent_size = 28, output_size = 224):
+    def __init__(self, input_channels = 3, latent_dim = 4, depth = 5, latent_size = 16, output_size = 30):
         """
         Args:
             input_channels (int): Number of channels in the input image (e.g., 3 for RGB).
@@ -147,7 +147,7 @@ def test_vae():
     vae = VAE()
 
     image = torch.randn(1, 3, 224, 224)
-    # TODO: fix decode output size
+
     _, _, latent = vae.encode(image)
 
     print(latent.size())

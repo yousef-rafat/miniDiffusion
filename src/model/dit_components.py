@@ -23,7 +23,7 @@ def patchify(x: Tensor, size: int, stride = None):
 
     return patches
 
-def depatchify(x: Tensor, img_size: int) -> torch.Tensor:
+def depatchify(x: Tensor) -> torch.Tensor:
     " turn patches into an image "
 
     # check if image is 4 by 4 patches
@@ -31,6 +31,7 @@ def depatchify(x: Tensor, img_size: int) -> torch.Tensor:
 
     grid_size = math.ceil(math.sqrt(patches))
     total_patches = grid_size * grid_size
+    img_size = grid_size * size
 
     # pad the tensor with zeros if there's not enough patches
     if patches < total_patches:
@@ -38,8 +39,6 @@ def depatchify(x: Tensor, img_size: int) -> torch.Tensor:
         pad_count = total_patches - patches
         pad_tensor = torch.zeros(batch, pad_count, channels, size, size, device = x.device, dtype = x.dtype)
         x = torch.cat([x, pad_tensor], dim = 1)
-
-    assert grid_size * size == img_size, "Image must be 4x4 patches"
 
     # turning patches into images 
     x = x.view(batch, grid_size, grid_size, channels, size, size)
@@ -56,7 +55,8 @@ class ConditionalPromptNorm(nn.Module):
 
         # normalization
         # elementwise_affine will put biases into zeros and weights into ones
-        self.norm = nn.LayerNorm(hidden_size, elementwise_affine = False)
+        # and make them trainable
+        self.norm = nn.LayerNorm(hidden_size, elementwise_affine = True)
         # FF layer
         self.fcw = nn.Linear(dim, hidden_size)
         self.fcb = nn.Linear(dim, hidden_size)
@@ -124,9 +124,17 @@ class HandlePrompt(nn.Module):
 
     def forward(self, prompt: str):
 
+        # tokenize input
         x, attention_mask = self.tokenizer.tokenize(prompt)
-        features = self.clip.encode_text(x.unsqueeze(0))
-        x = self.norm(x.float(), features)
+
+        # get embedded representation of our data
+        x_embed = self.clip.text_encoder.token_embedding(x.unsqueeze(0))
+
+        # get global representation that result from passing it into multiple TransformerEncoder blocks
+        features = self.clip.encode_text(x.unsqueeze(0), attention_mask = attention_mask.unsqueeze(0))
+
+        # normalize embeddings for more stable trainings
+        x = self.norm(x_embed.float(), features)
 
         return x, attention_mask
     

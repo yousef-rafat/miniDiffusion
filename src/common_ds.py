@@ -11,7 +11,7 @@ import torchvision.transforms.v2 as v2
 from torchvision.transforms import ToTensor
 from torchvision.datasets import ImageFolder
 from model.dit_components import HandlePrompt
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import IterableDataset, DataLoader 
 
 effects = v2.Compose([
     v2.RandomRotation(degrees=(0, 60)),
@@ -36,12 +36,12 @@ class NamedImageFolder(ImageFolder):
         class_name = self.classes[label]
         return image, class_name
     
-class ImageDataset(Dataset):
-    def __init__(self, image_dataset: NamedImageFolder, transforms = None):
+class ImageDataset(IterableDataset):
+    def __init__(self, image_dataset: NamedImageFolder, transforms = None, batch: int = 4):
         super(ImageDataset, self).__init__()
         
-        self.images = [image for image, _ in image_dataset.samples]
-        self.labels = [image_dataset.classes[label] for _, label in image_dataset.samples]
+        self.images = image_dataset.samples # list (img_path, label_index)
+        self.labels = image_dataset.classes
 
         self.transforms = transforms
         self.scheduler = NoiseScheduler(beta = 0.9, timesteps = 10)
@@ -49,36 +49,50 @@ class ImageDataset(Dataset):
         self.prompt_handle = HandlePrompt()
         self.vae = VAE()
 
-    def __len__(self):
-        return len(self.images)
-    
-    def __getitem__(self, idx):
+        self.batch_size = batch
+
+    def __iter__(self):
         # in the forward pass of the model
         # we compare both the distributions of noise and image (returned values)
         # along with using input_ids and attention_mask for clip loss
 
-        image_dir = self.images[idx]
-        image = io.read_image(image_dir)
+        batch = []
+        # lazy loading for efficient memory usuage
+        for image_path, label_idx in self.images:
 
-        label = self.labels[idx]
-        input_ids, attention_mask = self.prompt_handle(label)
+            try:
 
-        if self.transforms:
-            image = self.transforms(image)
+                image = io.read_image(image_path)
 
-        # normalize
-        image = image.float() / 255.0
-        image = image.expand(3, -1, -1) # turn to RGB
+                label = self.labels[label_idx]
+                input_ids, attention_mask = self.prompt_handle(label)
 
-        _, _, latent = self.vae.encode(image) # turn to latent space
+                if self.transforms:
+                    image = self.transforms(image)
 
-        noise, _ = self.scheduler.add_noise(latent.unsqueeze(0))
+                # normalize
+                image = image.float() / 255.0
+                image = image.expand(3, -1, -1) # turn to RGB
 
-        noise = self.make_trainable(noise)
+                _, _, latent = self.vae.encode(image) # turn to latent space
 
-        noise = noise.detach()
+                noise, _ = self.scheduler.add_noise(latent.unsqueeze(0))
 
-        return latent.detach(), noise, input_ids.detach(), attention_mask.detach()
+                noise = self.make_trainable(noise)
+
+                # do manual batching
+                batch.append((latent,
+                             noise,
+                             image,
+                             input_ids.detach(),
+                             attention_mask.detach()))
+                
+                if len(batch) == self.batch_size:
+                    yield batch
+                    batch = []
+
+            except Exception as e:
+                print("(-) Error: ", e)
 
 def check_dataset_dir(type: str):
     # check if the dir of dataset is valid
@@ -87,38 +101,31 @@ def check_dataset_dir(type: str):
     
     return True
 
-def get_dataloader(dataset, batch_size: int = 32, shuffle: bool = True, device: str = "cpu") -> DataLoader:
+def get_dataloader(dataset, device: str = "cpu") -> DataLoader:
     """ Returns an optimized DataLoader based on the computing device. """
-
-    # num of workers == num of cpu cores    
-    num_workers = max(1, os.cpu_count() // 2) if device == "cuda" else max(1, os.cpu_count() // 4)
     
     # enable pin memory for gpu
     pin_memory = device == "cuda"
-    
-    prefetch_factor = 2 if num_workers > 0 else None
-    persistent_workers = num_workers > 0
-    
+
     return DataLoader(
         dataset,
-        batch_size = batch_size,
-        shuffle = shuffle,
-        num_workers = num_workers,
+        batch_size = 1, # batch size one for IterableDataset
+        num_workers = 0,
         pin_memory = pin_memory,
-        persistent_workers = persistent_workers,
-        prefetch_factor = prefetch_factor
+        prefetch_factor = None,
+        persistent_workers = False,
     )
 
-def get_dataset(path: str, batch_size: int, shuffle: bool = True, device: str = "cpu") -> DataLoader:
+def get_dataset(path: str, batch_size: int, device: str = "cpu") -> DataLoader:
     " Get dataset ready "
 
     dataset = NamedImageFolder(path, transform = effects)
-    dataset = ImageDataset(dataset)
-    dataloader = DataLoader(dataset, batch_size = batch_size, shuffle = shuffle)#get_dataloader(dataset, shuffle = shuffle, batch_size = batch_size, device = device)
+    dataset = ImageDataset(dataset, batch = batch_size)
+    dataloader = get_dataloader(dataset, device = device)
 
     return dataloader
 
-def get_fashion_mnist_dataset(batch_size: int = 32, shuffle: bool = True, device: str = "cpu") -> DataLoader:
+def get_fashion_mnist_dataset(batch_size: int = 2, device: str = "cpu") -> DataLoader:
     """
     Get Fashion MNIST dataset ready for train.py script
     """
@@ -154,20 +161,20 @@ def get_fashion_mnist_dataset(batch_size: int = 32, shuffle: bool = True, device
 
         shutil.rmtree(os.path.join(os.getcwd(), "data", "FashionMNIST"))
 
-    train_dataset = get_dataset(train_dir, batch_size = batch_size, shuffle = shuffle, device = device)
-    test_dataset = get_dataset(test_dir, batch_size = batch_size, shuffle = shuffle, device = device)
+    train_dataset = get_dataset(train_dir, batch_size = batch_size, device = device)
+    test_dataset = get_dataset(test_dir, batch_size = batch_size, device = device)
 
     return train_dataset, test_dataset
 
 def test_fashion():
     train_dataset, _ = get_fashion_mnist_dataset()
 
-    for (image, _, label, _) in train_dataset:
-        image = image[0]
-        label = label[0]
+    for batch in train_dataset: # (_, _, image, label, _)
+        image = batch[0][2]
+        label = batch[0][3]
 
         plt.figure()
-        plt.imshow(image.permute(1, 2, 0).detach().numpy()) 
-        plt.title(label)
+        plt.imshow(image.squeeze(0).permute(1, 2, 0).detach().to(torch.float32).numpy()) 
+        plt.title(label.squeeze(0))
         plt.show()
         break

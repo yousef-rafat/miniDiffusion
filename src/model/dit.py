@@ -56,6 +56,9 @@ class DiT(nn.Module):
 
         patches, time_embeddings = self.handle_patches(latent)
 
+        # remove additional dim
+        if input_ids.dim() == 4: input_ids = input_ids.squeeze(1)
+
         # concatenate patches and tokens
         # resize for torch.cat
         patches = patches.view(patches.size(0), -1, self.embed_size)
@@ -84,7 +87,7 @@ class DiT(nn.Module):
         # remove text processing from image
         x = x[:, attention_mask.size(1):, :].reshape(x.size(0), -1 , 4, self.p_size, self.p_size)
 
-        output = depatchify(x, img_size = 40)
+        output = depatchify(x)
 
         return output
     
@@ -106,7 +109,7 @@ class DiT(nn.Module):
 
         x = x.reshape(x.size(0), -1 , 4, self.p_size, self.p_size)
 
-        output = depatchify(x, img_size = 40)
+        output = depatchify(x)
 
         return output
 

@@ -13,7 +13,9 @@ from common import loss_fn, interpolate_samples, get_ground_truth_velocity, comp
 def train(device: Optional[str], train_dataset: Optional[str], eval_dataset: Optional[str], epochs: int = 10, lr: float = 0.003, batch_size: int = 64, 
           euler: bool = False, log: bool = False):
     
-    model = DiT(embedding_size = 512, heads = 8, depth = 6).to(device)
+    torch.autograd.set_detect_anomaly(True)
+
+    model = DiT(embedding_size = 512, heads = 8, depth = 6).to(device = device)
 
     # turn fused only on when gpu is available
     optimizer = torch.optim.AdamW(model.parameters(), lr = lr,
@@ -46,7 +48,7 @@ def train(device: Optional[str], train_dataset: Optional[str], eval_dataset: Opt
 
         # remove extra dimension
         noise = noise.squeeze(1)
-        input_ids = input_ids.long().squeeze(2)
+        input_ids = input_ids.squeeze(2)
 
         # random times for training
         # broadcast height, width, and channels
@@ -61,16 +63,27 @@ def train(device: Optional[str], train_dataset: Optional[str], eval_dataset: Opt
 
         drift = model(latent = intr_sampls, t = t, input_ids = input_ids, attention_mask = attention_mask)
         loss = loss_fn(drift, directions, alpha_t = alpha_t)
+        
+        if euler: denoised_latent = noiser.euler_solver(model, noise.detach())
+        else: denoised_latent = noiser.rk4_solver(model, noise.detach())
 
-        if euler: denoised_latent = noiser.euler_solver(model, noise)
-        else: denoised_latent = noiser.rk4_solver(model, noise)
-
-        generated_image = vae.decode(denoised_latent)
+        generated_image = vae.decode(denoised_latent.detach())
 
         clip_loss = compute_clip_loss(clip, generated_image, input_ids, attention_mask, size = generated_image.size(-1))
         loss += clip_loss
 
         return loss, generated_image
+    
+    def stack_tensors(batch):
+
+        # stack all the tensors to get elements of tuples
+        latent = torch.stack([sample[0] for sample in batch]).squeeze(1)
+        noise = torch.stack([sample[1] for sample in batch]).squeeze(1) 
+        image = torch.stack([sample[2] for sample in batch]).squeeze(1)
+        input_ids = torch.stack([sample[3] for sample in batch]).squeeze(1)
+        attention_mask = torch.stack([sample[4] for sample in batch]).squeeze(1)
+
+        return latent, noise, image, input_ids, attention_mask
 
     train_losses, eval_losses = [], []
     for epoch in range(epochs):
@@ -79,11 +92,12 @@ def train(device: Optional[str], train_dataset: Optional[str], eval_dataset: Opt
         model.train()
 
         print("Starting to train...")
-        for i, (image, noise, input_ids, attention_mask) in enumerate(train_dataset):
-            
-            optimizer.zero_grad()
+        # (latent, noise, image, input_ids, attention_mask)
+        for i, batch in enumerate(train_dataset):
 
-            loss, generated_image = fit(image = image, noise = noise, input_ids = input_ids, attention_mask = attention_mask)
+            latent, noise, image, input_ids, attention_mask = stack_tensors(batch)
+
+            loss, generated_image = fit(image = latent, noise = noise, input_ids = input_ids, attention_mask = attention_mask)
 
             fid_score = metric(generated_image, image)
 
@@ -92,17 +106,26 @@ def train(device: Optional[str], train_dataset: Optional[str], eval_dataset: Opt
 
             if log: train_losses.append(avg_loss)
 
+            optimizer.zero_grad()
             loss.backward()
             optimizer.step()
 
-            description = f'Train Epoch: {epoch}, Loss: {avg_loss}, FID: {fid_score}'
+            # reset the KV cache to not get multiple (unintented) backward passes
+            for layer in model.model:
+                if hasattr(layer, "self_attn"):
+                    layer.self_attn.reset_cache()
+
+            description = f'Train Epoch: {epoch + 1}, Loss: {avg_loss:.2f}, FID: {fid_score:.2f}'
             print(description)
 
         if not eval_dataset: continue
 
         model.eval()
         eval_loss = 0
-        for i, (image, noise, input_ids, attention_mask) in enumerate(eval_dataset):
+        for i, batch in enumerate(eval_dataset):
+
+            latent, noise, image, input_ids, attention_mask = stack_tensors(batch)
+
             loss, generated_image = fit(image = image, noise = noise, input_ids = input_ids, attention_mask = attention_mask)
             fid_score = metric(generated_image, image)
 
@@ -111,7 +134,7 @@ def train(device: Optional[str], train_dataset: Optional[str], eval_dataset: Opt
 
             if log: eval_losses.append(avg_loss)
 
-        description = f'Eval Epoch: {epoch}, Loss: {avg_loss}, FID: {fid_score}'
+        description = f'Eval Epoch: {epoch + 1}, Loss: {avg_loss:.2f}, FID: {fid_score:.2f}'
         print(description)
 
     # save model and log the output
