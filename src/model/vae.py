@@ -3,7 +3,7 @@ import torch.nn as nn
 
 class VAE(nn.Module):
     # Create the variational autoencoder
-    def __init__(self, input_channels = 3, latent_dim = 4, depth = 5, latent_size = 16, output_size = 30):
+    def __init__(self, input_channels = 3, latent_dim = 4, depth = 5, latent_size = 16, output_size = 28):
         """
         Args:
             input_channels (int): Number of channels in the input image (e.g., 3 for RGB).
@@ -44,7 +44,7 @@ class VAE(nn.Module):
         self.final_channels = in_channels
 
         # layer for decoding the latents
-        self.fc_decode = nn.Linear(4 * latent_size * latent_size, self.final_channels * latent_size * latent_size)
+        self.fc_decode = nn.Linear(latent_dim * latent_size * latent_size, self.final_channels * latent_size * latent_size)
 
         # ////////////////////
         # Building the Decoder
@@ -80,7 +80,7 @@ class VAE(nn.Module):
             in_channels = output_channels
 
         # last layer to get the image to the original number of channels
-        decoder_layers.append(nn.Conv2d(in_channels, input_channels, kernel_size = 3))
+        decoder_layers.append(nn.Conv2d(in_channels, input_channels, kernel_size = 3, padding = 1))
 
         # we will add a sigmoid layer to ensure our output is between 0-1
         # without the sigmoid, the model will have to learn that the output is between 0 and 1
@@ -132,11 +132,15 @@ class VAE(nn.Module):
         return image
     
 
-def load_vae(model: VAE, path: str, device: str = "cpu") -> VAE:
-    # load checkpoint into the model
+def load_vae(model: VAE, device: str = "cpu") -> VAE:
+
+    # checkpoints could be installed automatically from encoders/get_checkpoints.py
+
+    import os
+    path = os.path.join(os.getcwd(), os.path.join("encoders", "hub", "checkpoints", "vae_checkpoint.pth"))
 
     checkpoint = torch.load(path, map_location = device)
-    model.load_state_dict(checkpoint)
+    model.load_state_dict(checkpoint, strict = False)
 
     model.eval()
 
@@ -144,13 +148,26 @@ def load_vae(model: VAE, path: str, device: str = "cpu") -> VAE:
 
 def test_vae():
 
+    from torchvision.transforms import ToTensor
+    import matplotlib.pyplot as plt
+    from PIL import Image
+    import os
+
     vae = VAE()
+    vae = load_vae(model = vae)
 
-    image = torch.randn(1, 3, 224, 224)
+    image_dir = os.path.join(os.getcwd(), "assets", "cat.webp")
+    image = Image.open(image_dir).convert("RGB")
+    image = ToTensor()(image)
 
-    _, _, latent = vae.encode(image)
+    _, _, latent = vae.encode(image.unsqueeze(0))
 
     print(latent.size())
     image = vae.decode(latent = latent)
 
     print(image.size())
+
+    plt.figure()
+    plt.imshow(image.squeeze(0).permute(1, 2, 0).detach().to(torch.float32).numpy()) 
+    plt.axis("off")
+    plt.show()

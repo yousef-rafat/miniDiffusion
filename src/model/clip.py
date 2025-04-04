@@ -43,15 +43,6 @@ class ImageEncoder(nn.Module):
     def __init__(self, project_dim, size: int = 222):
         super(ImageEncoder, self).__init__()
 
-        model_path = os.path.join(os.getcwd(), "encoders", "hub", "checkpoints", "vit_b_16_lc_swag-4e70ced5.pth")
-
-        if os.path.exists(model_path): 
-            self.model = torchvision.models.vit_b_16(weights = ViT_B_16_Weights.IMAGENET1K_SWAG_LINEAR_V1)
-        else: 
-            # initate model and load state
-            self.model = torchvision.models.vit_b_16()
-            self.model.load_state_dict(torch.load(model_path))
-
         # change input layer to accept latents
         self.model.image_size = size
 
@@ -95,12 +86,9 @@ class CLIP(nn.Module):
 
         image_features = F.normalize(self.image_encoder(image), dim = -1)
 
-        #if input_ids.dim() != 3: text_features = F.normalize(self.text_encoder(input_ids, attention_mask), dim = -1)
-        #else: 
-            # masked mean pooling so only non-padded tokens contribute
-
         if input_ids.dim() == 4: input_ids = input_ids.squeeze(1)
 
+        # masked mean pooling so only non-padded tokens contribute
         text_features = input_ids.float() * attention_mask.unsqueeze(-1)
         text_features = text_features.sum(dim = 1) / attention_mask.sum(dim = 1, keepdim = True)
 
@@ -119,14 +107,28 @@ class CLIP(nn.Module):
 
         return text_embeddings
 
+def load_clip(model: CLIP, device = "cpu"):
+
+    # checkpoints could be installed automatically from encoders/get_checkpoints.py
+
+    text_path = os.path.join(os.getcwd(), "encoders", "hub", "checkpoints", "clip_text_checkpoint.pth")
+    image_path = os.path.join(os.getcwd(), "encoders", "hub", "checkpoints", "clip_vision_checkpoint.pth")
+
+    model.image_encoder.load_state_dict(torch.load(image_path, map_location = device), strict = False)
+    model.text_encoder.load_state_dict(torch.load(text_path, map_location = device), strict = False)
+
+    return model
+
 
 def test_clip(mask = True):
 
     model = CLIP()
-    image = torch.rand(3, 224, 224)
-    input_ids = torch.randint(50000, size = (1024, 512))
+    image = torch.rand(3, 222, 222)
+    input_ids = torch.rand(1, 512, 512)
 
-    if mask: attn_mask = torch.zeros(1024, 512)
+    model = load_clip(model)
+
+    if mask: attn_mask = torch.zeros(1, 512)
 
     outputs = model(image = image.unsqueeze(0), input_ids = input_ids.unsqueeze(0), attention_mask = attn_mask.unsqueeze(0))
     print("output: ", outputs)

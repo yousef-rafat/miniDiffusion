@@ -44,6 +44,10 @@ class FID(nn.Module):
         gn_img = F.interpolate(generated_image, size = (299, 299), mode = 'bilinear' , align_corners = False)
         rl_img = F.interpolate(real_image, size = (299, 299), mode = 'bilinear' , align_corners = False)
 
+        # normalize images
+        gn_img = gn_img / 255.0
+        rl_img = rl_img / 255.0
+
         with torch.no_grad():
             gen_features = self.model(gn_img)
             rl_features = self.model(rl_img)
@@ -57,6 +61,11 @@ class FID(nn.Module):
         sigma_gen = torch.cov(gen_features.T) if gen_features.shape[0] > 1 else torch.eye(gen_features.shape[1])
         sigma_rl = torch.cov(rl_features.T) if rl_features.shape[0] > 1 else torch.eye(rl_features.shape[1])
 
+        eps = 1e-6
+        # add a small eps to the diagonal of the sigmas (better num. stability)
+        sigma_gen += torch.eye(sigma_gen.size(0)).to(sigma_gen.device) * eps
+        sigma_rl += torch.eye(sigma_rl.size(0)).to(sigma_rl.device) * eps
+
         # compute square difference
         diff = mu_rl - mu_gen
         mu_diff = torch.sum(diff ** 2)
@@ -65,7 +74,7 @@ class FID(nn.Module):
 
         fid_score = mu_diff + torch.trace(sigma_gen + sigma_rl - 2 * covmean)
 
-        return fid_score
+        return torch.clamp(fid_score, min = 0)
     
 def test_fid():
     gen_img = torch.rand(3, 224, 224)

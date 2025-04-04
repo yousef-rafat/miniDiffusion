@@ -2,31 +2,44 @@ import os
 import torch
 import argparse
 from model.dit import DiT
-from model.vae import VAE
-from model.clip import CLIP
 from typing import Optional
 from model.metrics import FID
+from model.vae import VAE, load_vae
+from model.clip import CLIP, load_clip
 from model.noise import NoiseScheduler
+from torch.optim.lr_scheduler import LambdaLR
 from common_ds import get_dataset, get_fashion_mnist_dataset, check_dataset_dir
 from common import loss_fn, interpolate_samples, get_ground_truth_velocity, compute_clip_loss
 
-def train(device: Optional[str], train_dataset: Optional[str], eval_dataset: Optional[str], epochs: int = 10, lr: float = 0.003, batch_size: int = 64, 
-          euler: bool = False, log: bool = False):
-    
-    torch.autograd.set_detect_anomaly(True)
+def train(device: Optional[str], train_dataset: Optional[str], eval_dataset: Optional[str] = None, epochs: int = 3, lr: float = 0.0001, batch_size: int = 64, 
+          euler: bool = False, log: bool = True):
 
-    model = DiT(embedding_size = 512, heads = 8, depth = 6).to(device = device)
+    model = DiT(embedding_size = 512, heads = 8, depth = 10).to(device = device)
+    torch.manual_seed(2025)
 
     # turn fused only on when gpu is available
     optimizer = torch.optim.AdamW(model.parameters(), lr = lr,
                                   fused = True if torch.cuda.is_available() else False)
+    
+    # go from 0 to inital learning (lr) in warmup_steps and stay there
+    warmup_steps = 100
+    def lr_lambda(current_step):
+        if current_step < warmup_steps:
+            return float(current_step) / float(max(1, warmup_steps))
+        return 1.0
+
+    scheduler = LambdaLR(optimizer, lr_lambda)
 
     noiser = NoiseScheduler(beta = 0.9, timesteps = 10)
     metric = FID()
     vae = VAE()
     clip = CLIP()
 
-    save_path = os.path.join(os.getcwd(), "model")
+    vae = load_vae(model = vae, device = device)
+    clip = load_clip(model = clip, device = device)
+
+    save_path = os.path.join(os.getcwd(), "model", "checkpoint.pth")
+    if os.path.exists(save_path): model.load_state_dict(torch.load(save_path))
 
     if not device: device = next(model.parameters()).device
 
@@ -38,7 +51,7 @@ def train(device: Optional[str], train_dataset: Optional[str], eval_dataset: Opt
         check_dataset_dir("train_ds")
         train_dataset = get_dataset(train_dataset, batch_size = batch_size, device = device)
 
-    elif eval_dataset:
+    elif eval_dataset is not None:
         check_dataset_dir("eval_ds")
         eval_dataset = get_dataset(eval_dataset, batch_size = batch_size, device = device)
 
@@ -58,7 +71,7 @@ def train(device: Optional[str], train_dataset: Optional[str], eval_dataset: Opt
         t_index = (t * (noiser.timesteps - 1)).long()
         alpha_t = alpha_bar[t_index]
 
-        intr_sampls = interpolate_samples(image, noise, t)
+        intr_sampls = interpolate_samples(source = image, target = noise, t = t)
         directions = get_ground_truth_velocity(image, noise, alpha_t)
 
         drift = model(latent = intr_sampls, t = t, input_ids = input_ids, attention_mask = attention_mask)
@@ -85,16 +98,16 @@ def train(device: Optional[str], train_dataset: Optional[str], eval_dataset: Opt
 
         return latent, noise, image, input_ids, attention_mask
 
+    print("Starting to train...")
     train_losses, eval_losses = [], []
     for epoch in range(epochs):
 
         total_loss = 0
         model.train()
 
-        print("Starting to train...")
         # (latent, noise, image, input_ids, attention_mask)
         for i, batch in enumerate(train_dataset):
-
+            
             latent, noise, image, input_ids, attention_mask = stack_tensors(batch)
 
             loss, generated_image = fit(image = latent, noise = noise, input_ids = input_ids, attention_mask = attention_mask)
@@ -109,16 +122,17 @@ def train(device: Optional[str], train_dataset: Optional[str], eval_dataset: Opt
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            scheduler.step()
 
             # reset the KV cache to not get multiple (unintented) backward passes
             for layer in model.model:
                 if hasattr(layer, "self_attn"):
                     layer.self_attn.reset_cache()
 
-            description = f'Train Epoch: {epoch + 1}, Loss: {avg_loss:.2f}, FID: {fid_score:.2f}'
-            print(description)
+        description = f'Train Epoch: {epoch + 1}, Loss: {avg_loss:.2f}, FID: {fid_score:.2f}'
+        print(description)
 
-        if not eval_dataset: continue
+        if eval_dataset is None: continue
 
         model.eval()
         eval_loss = 0
@@ -126,7 +140,9 @@ def train(device: Optional[str], train_dataset: Optional[str], eval_dataset: Opt
 
             latent, noise, image, input_ids, attention_mask = stack_tensors(batch)
 
-            loss, generated_image = fit(image = image, noise = noise, input_ids = input_ids, attention_mask = attention_mask)
+            with torch.no_grad():
+                loss, generated_image = fit(image = latent, noise = noise, input_ids = input_ids, attention_mask = attention_mask)
+
             fid_score = metric(generated_image, image)
 
             eval_loss += loss.item()
@@ -142,7 +158,8 @@ def train(device: Optional[str], train_dataset: Optional[str], eval_dataset: Opt
 
     if log:
         import csv
-        with open("log.csv", "w", newline = "") as f:
+        log_dir = os.path.join("model", "log.csv")
+        with open(log_dir, "w", newline = "") as f:
             writer = csv.writer(f)
             writer.writerow(["Train", "Eval"])
             writer.writerows(zip(train_losses, eval_losses))
@@ -156,7 +173,7 @@ def get_args():
     parser.add_argument("--eval_dataset", type = str, required = False, help = "Path to the evaluation dataset")
     parser.add_argument("--epochs", type = int, default = 5, help = "Number of training epochs")
     parser.add_argument("--lr", type = float, default = 0.003, help = "Learning rate")
-    parser.add_argument("--batch_size", type = int, default = 2, help = "Batch size for training")
+    parser.add_argument("--batch_size", type = int, default = 4, help = "Batch size for training")
     parser.add_argument("--euler", action = "store_true", help=  "Enable Euler mode")
     parser.add_argument("--log", action = "store_true", help = "Enable logging")
 
@@ -173,5 +190,4 @@ if __name__ == "__main__":
         lr = args.lr,
         batch_size = args.batch_size,
         euler = args.euler,
-        log = args.log
     )

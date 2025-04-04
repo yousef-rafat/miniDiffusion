@@ -2,9 +2,9 @@ import os
 import torch
 import shutil
 import torchvision
+from PIL import Image
 import torch.nn as nn
 from model.vae import VAE
-import torchvision.io as io
 import matplotlib.pyplot as plt
 from model.noise import NoiseScheduler 
 import torchvision.transforms.v2 as v2
@@ -37,7 +37,7 @@ class NamedImageFolder(ImageFolder):
         return image, class_name
     
 class ImageDataset(IterableDataset):
-    def __init__(self, image_dataset: NamedImageFolder, transforms = None, batch: int = 4):
+    def __init__(self, image_dataset: NamedImageFolder, transforms = None, batch: int = 4, max_samples = 12):
         super(ImageDataset, self).__init__()
         
         self.images = image_dataset.samples # list (img_path, label_index)
@@ -50,6 +50,7 @@ class ImageDataset(IterableDataset):
         self.vae = VAE()
 
         self.batch_size = batch
+        self.max_samples = max_samples
 
     def __iter__(self):
         # in the forward pass of the model
@@ -57,12 +58,16 @@ class ImageDataset(IterableDataset):
         # along with using input_ids and attention_mask for clip loss
 
         batch = []
+        sample_count = 0
         # lazy loading for efficient memory usuage
         for image_path, label_idx in self.images:
 
             try:
 
-                image = io.read_image(image_path)
+                if sample_count >= self.max_samples:
+                    break
+
+                image = Image.open(image_path)
 
                 label = self.labels[label_idx]
                 input_ids, attention_mask = self.prompt_handle(label)
@@ -86,6 +91,8 @@ class ImageDataset(IterableDataset):
                              image,
                              input_ids.detach(),
                              attention_mask.detach()))
+                
+                sample_count += 1
                 
                 if len(batch) == self.batch_size:
                     yield batch
@@ -119,8 +126,8 @@ def get_dataloader(dataset, device: str = "cpu") -> DataLoader:
 def get_dataset(path: str, batch_size: int, device: str = "cpu") -> DataLoader:
     " Get dataset ready "
 
-    dataset = NamedImageFolder(path, transform = effects)
-    dataset = ImageDataset(dataset, batch = batch_size)
+    dataset = NamedImageFolder(path)
+    dataset = ImageDataset(dataset, batch = batch_size, transforms = effects)
     dataloader = get_dataloader(dataset, device = device)
 
     return dataloader

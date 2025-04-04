@@ -8,11 +8,11 @@ import torch.nn as nn
 def loss_fn(v_pred: torch.Tensor, v_true: torch.Tensor, alpha_t):
     # computes MSE for velocity vectors with scaled alpha t over beta t
 
-    alpha_t = torch.sqrt(alpha_t)
+    sqrt_alpha_t = torch.sqrt(alpha_t)
     beta_t = torch.sqrt(1 - alpha_t)
 
     # small value to avoid division by zero
-    weight = (alpha_t / (beta_t + 1e-8))
+    weight = (sqrt_alpha_t / (beta_t + 1e-8))
 
     v_pred = v_pred[:, :, :v_true.size(-1), :v_true.size(-1)]
     
