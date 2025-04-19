@@ -4,7 +4,7 @@ import torch
 from itertools import takewhile
 
 class TorchTokenizer:
-    def __init__(self, tokenizer_path: str = "tokenizer.json", max_length: int = 512):
+    def __init__(self, tokenizer_path: str = "tokenizer.json", max_length: int = 77):
 
         # Load the tokenizer.json file
         file_path = os.path.join(os.getcwd(), "src", "model", tokenizer_path)
@@ -19,15 +19,13 @@ class TorchTokenizer:
         self.inv_vocab = {v: k for k, v in self.vocab.items()}
 
         self.vocab_len = len(self.vocab)
-        self.special_vocab = { '<pad>': self.vocab_len + 1, '<start>': self.vocab_len + 2, '<end>': self.vocab_len + 3, '<unk>': self.vocab_len + 4 }
 
-        self.inv_vocab.update({v: k for k, v in self.special_vocab.items()})
+        self.start = tokenizer_data['added_tokens'][0]['id']
+        self.end = tokenizer_data['added_tokens'][1]['id']
 
-        self.start = self.special_vocab['<start>']
-        self.end = self.special_vocab['<end>']
-        self.pad_id = self.special_vocab['<pad>']
+        self.pad_id = self.unk_token = self.end
 
-        self.unk_token = self.special_vocab['<unk>']
+        self.special_vocab = ["<|startoftext|>", "<|endoftext|>"]
 
     def tokenize(self, text):
         """Tokenizes text by splitting on whitespace and maps to vocab."""
@@ -60,8 +58,7 @@ class TorchTokenizer:
         tokens = [self.inv_vocab.get(id, self.unk_token) for id in takewhile(lambda x: x != self.pad_id, token_ids)]
 
         if skip_special_tokens:
-            special_tokens = set(self.special_vocab.keys())
-            tokens = [token for token in tokens if token not in special_tokens]
+            tokens = [token for token in tokens if token not in self.special_vocab]
 
         return " ".join(tokens)
     
@@ -69,7 +66,10 @@ class TorchTokenizer:
 def test_tokenizer():
     tokenizer = TorchTokenizer()
     text = "hello world"
-    token_ids = tokenizer.tokenize(text)
+    token_ids, _ = tokenizer.tokenize(text)
 
     print("Tokenized:", token_ids) 
     print("Detokenized:", tokenizer.detokenize(token_ids.tolist()))
+
+if __name__ == "__main__":
+    test_tokenizer()

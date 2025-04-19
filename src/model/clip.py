@@ -1,134 +1,312 @@
+############################################################################## REIMPLEMENTATION OF OPENAI CLIP ############################################################################
+
 import os
 import torch
-import torchvision
 import torch.nn as nn
 import torch.nn.functional as F
-from model.tokenizer import TorchTokenizer
-from torchvision.models import ViT_B_16_Weights
-from model.attention import PagedTransformerEncoderLayer
+from tokenizer import TorchTokenizer
+from torchvision.transforms.v2 import Resize
 
 class TextEncoder(nn.Module):
-    def __init__(self, project_dim, embed_dim: int = 512, heads: int = 8, depth: int = 5):
+    def __init__(self, embed_dim: int = 512):
         super(TextEncoder, self).__init__()
 
-        self.model = nn.ModuleList(
-            [PagedTransformerEncoderLayer(num_heads = heads, embed_dim =  embed_dim) for _ in range(depth)]
-        )
+        vocab_size = 49408
 
-        self.tokenizer = TorchTokenizer()
+        self.embeddings = nn.Module()
+        self.embeddings.token_embedding = nn.Embedding(vocab_size, embed_dim)
+        # tokenizer's context_length must be set to 77 tokens
+        self.embeddings.position_embedding = nn.Embedding(77, embed_dim) # 77 = context length
 
-        self.projection = nn.Linear(embed_dim, project_dim)
-        self.layer_norm = nn.LayerNorm(project_dim)
+        self.encoder = Encoder(embed_size = embed_dim)
 
-        vocab_size = 50262
-        self.token_embedding = nn.Embedding(vocab_size, embed_dim)
+        self.final_layer_norm = nn.LayerNorm(embed_dim)
 
     def forward(self, x: torch.Tensor, attention_mask: torch.Tensor):
 
-        x = self.token_embedding(x.long())
+        x = self.embeddings.token_embedding(x.long())
+
+        #                       seq_length
+        positions = torch.arange(x.size(1))
+        pos_embed = self.embeddings.position_embedding(positions)
+
+        x += pos_embed
 
         # obtain text embeddings
-        for layer in self.model:
-            x = layer(x, src_key_padding_mask = (attention_mask == 0).float())
+        x = x.permute(1, 0, 2)
+        x = self.encoder(x, attention_mask)
+        x = x.permute(1, 0, 2)
 
+        # ensure batch dim
         if x.dim() == 2: x = x.unsqueeze(0)
-        # get classification token
-        x = x[:, 0, :]
+        if attention_mask.dim() == 1: attention_mask = attention_mask.unsqueeze(0)
 
-        x = self.projection(x)
+        # get the length of the valid tokens (non padded)
+        token_lens = attention_mask.sum(dim = 1)
+        # get the last token so we can get EOS token
+        inds = token_lens - 1
+        # for each batch, get the last token
+        x = x[torch.arange(x.size(0)), inds]
 
-        return self.layer_norm(x)
+        return self.final_layer_norm(x)
+    
+class AttentionPool2d(nn.Module):
+    # modified class from: https://github.com/openai/CLIP/blob/main/clip/model.py#L58
+    def __init__(self, embed_dim: int, num_heads: int, output_dim: int = None):
+        super().__init__()
 
-class ImageEncoder(nn.Module):
-    def __init__(self, project_dim, size: int = 222):
-        super(ImageEncoder, self).__init__()
+        self.k_proj = nn.Linear(embed_dim, embed_dim)
+        self.q_proj = nn.Linear(embed_dim, embed_dim)
+        self.v_proj = nn.Linear(embed_dim, embed_dim)
 
-        # change input layer to accept latents
-        self.model.image_size = size
+        self.num_heads = num_heads
+        
+        if output_dim is None: self.out_proj = nn.Linear(embed_dim, embed_dim)
+        else: self.out_proj = nn.Linear(embed_dim, output_dim)
 
-        # correct positional embedding
-        num_patches = (size // 16) ** 2 
-        hidden_dim = self.model.hidden_dim
-        self.model.encoder.pos_embedding = nn.Parameter(torch.randn(1, num_patches + 1, hidden_dim))
+    def forward(self, x, src_pad_key = None, text = False):
 
-        self.projection = nn.Linear(1000, project_dim)
-        self.layer_norm = nn.LayerNorm(project_dim)
-        self.size = size
+        # ensure (seq_len, B, embed_dim)
+        if x.shape[0] == 1:
+            x = x.permute(1, 0, 2)
+
+        if text: query = x
+        else: query = x[:1]
+
+        x, _ = F.multi_head_attention_forward(
+            query = query, key = x, value = x,
+            embed_dim_to_check = x.shape[-1],
+            num_heads=self.num_heads,
+            q_proj_weight=self.q_proj.weight,
+            k_proj_weight=self.k_proj.weight,
+            v_proj_weight=self.v_proj.weight,
+            in_proj_weight=None,
+            in_proj_bias=torch.cat([self.q_proj.bias, self.k_proj.bias, self.v_proj.bias]),
+            bias_k=None,
+            bias_v=None,
+            add_zero_attn=False,
+            dropout_p=0,
+            out_proj_weight=self.out_proj.weight,
+            out_proj_bias=self.out_proj.bias,
+            use_separate_proj_weight=True,
+            training = False,
+            need_weights = False,
+            key_padding_mask = src_pad_key
+        )
+
+        # (B, C)
+        return x.squeeze(0)
+class MLP(nn.Module):
+    def __init__(self, embed_size, ratio = 4):
+        super().__init__()
+
+        self.fc1 = nn.Linear(embed_size, embed_size * ratio)
+        self.fc2 = nn.Linear(embed_size * ratio, embed_size)
+        self.gelu = nn.GELU()
 
     def forward(self, x: torch.Tensor):
 
-        x = self.model(x)
-        x = self.projection(x)
+        x = self.fc1(x)
+        x = self.gelu(x)
+        x = self.fc2(x)
 
-        return self.layer_norm(x)
+        return x
+    
+class EncoderLayer(nn.Module):
+    def __init__(self, embed_size: int = 768, ratio: int = 4, num_heads: int = 8):
+        super().__init__()
+
+        self.layer_norm1 = nn.LayerNorm(embed_size)
+        self.layer_norm2 = nn.LayerNorm(embed_size)
+        self.mlp = MLP(embed_size = embed_size, ratio = ratio)
+
+        self.self_attn = AttentionPool2d(num_heads = num_heads, embed_dim = embed_size)
+
+    def forward(self, x: torch.Tensor, src_pad_key = None):
+        
+        if src_pad_key is not None: attn_out = self.self_attn(x, src_pad_key = src_pad_key, text = True)
+        else: attn_out = self.self_attn(x)
+
+        # normalize and apply residual connections
+        x = self.layer_norm1(x)
+        x += attn_out
+        x = self.layer_norm2(x)
+        x += self.mlp(x)
+
+        return x
+
+class Encoder(nn.Module):
+    def __init__(self, embed_size = 768):
+        super().__init__()
+
+        self.layers = nn.ModuleList([EncoderLayer(embed_size = embed_size) for _ in range(12)])
+
+    def forward(self, x: torch.Tensor, attention_mask = None):
+
+        if attention_mask is not None:
+            src_key_mask = attention_mask == 0
+            if src_key_mask.dim() == 1: src_key_mask = src_key_mask.unsqueeze(0)
+
+            for layer in self.layers:
+                x = layer(x, src_key_mask)
+        
+        else:
+            for layer in self.layers:
+                x = layer(x)
+
+        return x
+
+class ImageEncoder(nn.Module):
+    def __init__(self, project_dim: int = 768, embed_dim: int = 768):
+        super(ImageEncoder, self).__init__()
+
+        self.embeddings = nn.Module()
+        self.embeddings.class_embedding = nn.Parameter(torch.randn(embed_dim))
+
+        # slide over each kernel with stride and kernel size of 32 (typically no bias is used in these convs)
+        self.embeddings.patch_embedding = nn.Conv2d(in_channels = 3, out_channels = project_dim, kernel_size = 32, stride = 32, bias = False)
+        self.embeddings.position_embedding = nn.Embedding(50, embed_dim)
+
+        self.encoder = Encoder()
+        
+        self.pre_layrnorm = nn.LayerNorm(project_dim)
+        self.post_layernorm = nn.LayerNorm(project_dim)
+
+    def forward(self, x: torch.Tensor):
+        
+        # output: (B, embed_dim, H_, W_)
+        if x.dim() == 5: x = x.squeeze(0)
+        x = self.embeddings.patch_embedding(x)
+        x = x.flatten(2) # (B, embed_dim, HW)
+
+        # (B, HW, embed_dim)
+        x = x.transpose(1, 2)
+
+        cls_tokens = self.embeddings.class_embedding.unsqueeze(0).unsqueeze(0).expand(x.size(0), -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+
+        positions = torch.arange(x.size(1), device = x.device)
+        pos_embed = self.embeddings.position_embedding(positions)
+
+        x += pos_embed
+
+        x = self.pre_layrnorm(x)
+
+        x = x.permute(1, 0, 2)
+        x = self.encoder(x)
+        x = x.permute(1, 0, 2) 
+
+        # get cls token
+        x = x[:, 0, :]
+
+        x = self.post_layernorm(x)
+
+        return x
     
 class CLIP(nn.Module):
-    def __init__(self, project_dim: int = 512, embed_dim: int = 512, size: int = 222):
+    def __init__(self, project_dim: int = 768, embed_dim: int = 512):
         super(CLIP, self).__init__()
 
-        os.environ['TORCH_HOME'] = os.path.join(os.getcwd(), "encoders")
-
-        self.image_encoder = ImageEncoder(project_dim = project_dim, size = size)
-        self.text_encoder = TextEncoder(project_dim = project_dim, embed_dim = embed_dim)
+        self.vision_model = ImageEncoder(project_dim = project_dim)
+        self.text_model = TextEncoder(embed_dim = embed_dim)
+        self.tokenizer = TorchTokenizer()
         
-        self.temp = nn.Parameter(torch.ones([]) * 0.7)
-        self.project_dim = project_dim
+        self.logit_scale = nn.Parameter(torch.ones([]) * 0.7) 
+        self.visual_projection = nn.Linear(project_dim, embed_dim, bias = False)
+        self.text_projection = nn.Linear(embed_dim, embed_dim, bias = False)
 
-        self.image_encoder.eval()
-        self.text_encoder.eval()
+        self.vision_model.eval()
+        self.text_model.eval()
 
-    def adjust_image_size(self, size: int):
-        self.image_encoder = ImageEncoder(self.project_dim, size = size)
-
-    def forward(self, image: torch.Tensor, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    def forward(self, image: torch.Tensor, text_embed: torch.Tensor) -> torch.Tensor:
 
         " Compute the relationship between image and text  "
 
-        image_features = F.normalize(self.image_encoder(image), dim = -1)
+        # get fixed size to comply with the checkpoint position_embeddings nn.Embedding(50, embed_dim)
+        image = Resize(size=(224, 224))(image)
 
-        if input_ids.dim() == 4: input_ids = input_ids.squeeze(1)
+        image_features = self.vision_model(image)
 
-        # masked mean pooling so only non-padded tokens contribute
-        text_features = input_ids.float() * attention_mask.unsqueeze(-1)
-        text_features = text_features.sum(dim = 1) / attention_mask.sum(dim = 1, keepdim = True)
+        # projections
+        text_features = self.text_projection(text_embed)
+        image_features = self.visual_projection(image_features)
+        
+        # normalization
+        text_features = F.normalize(text_features, dim = -1)
+        image_features = F.normalize(image_features, dim = -1)
 
-        image_features = image_features / image_features.norm(dim = -1, keepdim = True)
-        text_features = text_features / text_features.norm(dim = -1, keepdim = True)  
-
-        logits = self.temp.exp() * (image_features @ text_features.t())
+        logits = self.logit_scale.exp() * (image_features @ text_features.t())
 
         return logits
     
-    def encode_text(self, input_ids: torch.Tensor, attention_mask: torch.Tensor):
-        """ Encodes tokens for ConditionalPromptNorm """
+    def encode_text(self, input_ids, attention_mask = None):
+        """ Tokenize (if needed) and encode texts, returning embeddings and mask. Function for ConditionalPromptNorm """
+
+        # tokenize strings if raw text passed
+        if attention_mask is None:
+            input_ids, attention_mask = self.tokenizer.tokenize(input_ids)
+        
+        # ensure batch dim
+        if input_ids.dim() == 1:
+            input_ids = input_ids.unsqueeze(0)
 
         with torch.no_grad():
-            text_embeddings = self.text_encoder(input_ids, attention_mask)
+            text_emb = self.text_model(input_ids.long(), attention_mask)
 
-        return text_embeddings
+        return text_emb
 
 def load_clip(model: CLIP, device = "cpu"):
 
     # checkpoints could be installed automatically from encoders/get_checkpoints.py
 
-    text_path = os.path.join(os.getcwd(), "encoders", "hub", "checkpoints", "clip_text_checkpoint.pth")
-    image_path = os.path.join(os.getcwd(), "encoders", "hub", "checkpoints", "clip_vision_checkpoint.pth")
+    clip_path = os.path.join(os.getcwd(), "encoders", "hub", "checkpoints", "clip_model.pth")
+    missing, unexpected = model.load_state_dict(torch.load(clip_path, map_location = device), strict = True)
 
-    model.image_encoder.load_state_dict(torch.load(image_path, map_location = device), strict = False)
-    model.text_encoder.load_state_dict(torch.load(text_path, map_location = device), strict = False)
+    # for debuggging
+    if len(missing) != 0:
+        print(f"Missing keys ({len(missing)}):", missing)
+        print(f"\nUnexpected keys ({len(unexpected)}):", unexpected)
+
+    model.eval()
 
     return model
 
+def test_clip():
 
-def test_clip(mask = True):
+    from PIL import Image
+    from torchvision.transforms import ToTensor
 
+    from torchvision import transforms
+    preprocess = transforms.Compose([
+        transforms.Resize(224, interpolation=transforms.InterpolationMode.BICUBIC),
+        transforms.CenterCrop(224),
+        transforms.ToTensor(),
+        transforms.Normalize(
+            mean=[0.48145466, 0.4578275, 0.40821073],
+            std=[0.26862954, 0.26130258, 0.27577711]
+        ),
+    ])
+ 
     model = CLIP()
-    image = torch.rand(3, 222, 222)
-    input_ids = torch.rand(1, 512, 512)
+
+    image_path = os.path.join(os.getcwd(), "assets", "cat.webp")
+
+    image = Image.open(image_path).convert("RGB")
+    image = preprocess(image).unsqueeze(0)
+    #image = ToTensor()(image).unsqueeze(0)
 
     model = load_clip(model)
 
-    if mask: attn_mask = torch.zeros(1, 512)
+    ids = model.encode_text("a photo of a cat")
 
-    outputs = model(image = image.unsqueeze(0), input_ids = input_ids.unsqueeze(0), attention_mask = attn_mask.unsqueeze(0))
-    print("output: ", outputs)
+    # run forward
+    logit = model(image, ids) 
+    print("Cat similarity:", logit)
+
+    # same for dog
+    ids2 = model.encode_text("a photo of a dog")
+    logit2 = model(image, ids2)
+    print("Dog similarity:", logit2)
+
+if __name__ == "__main__":
+    test_clip()

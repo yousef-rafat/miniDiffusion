@@ -1,7 +1,7 @@
 # Get Checkpoints to load for VAE and CLIP
 # ////////////////////////// NOT MEANT TO BE RAN WHILE INFERENCE OR TRAINING ////////////////////////////////////////////////////////////////////////
 
-from transformers import CLIPTextModel, CLIPVisionModel
+from transformers import CLIPModel
 from huggingface_hub import hf_hub_download
 from safetensors.torch import load_file
 import torch
@@ -30,16 +30,9 @@ torch.save(vae_state_dict, get_path("vae_checkpoint.pth"))
 print("Converted and Saved VAE .safetensors to .pth")
 
 # --- CLIP Part using Transformers ---
-# extract state_dict for text encoder 
-clip_text_model = CLIPTextModel.from_pretrained(clip_repo)
-clip_text_state_dict = clip_text_model.state_dict()
 
-torch.save(clip_text_state_dict, get_path("clip_text_checkpoint.pth"))
-print("Saved CLIP text encoder state_dict to .pth")
+clip_model = CLIPModel.from_pretrained(clip_repo)
+clip_model_state_dict = clip_model.state_dict()
 
-# extract stae_dict for image encodder
-clip_vision_model = CLIPVisionModel.from_pretrained(clip_repo)
-clip_vision_state_dict = clip_vision_model.state_dict()
-
-torch.save(clip_vision_state_dict, get_path("clip_vision_checkpoint.pth"))
-print("Saved CLIP vision encoder state_dict to .pth")
+torch.save(clip_model_state_dict,  get_path("clip_model.pth"))
+print("Saved CLIP state_dict to .pth")

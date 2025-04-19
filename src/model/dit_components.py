@@ -128,7 +128,7 @@ class HandlePrompt(nn.Module):
         x, attention_mask = self.tokenizer.tokenize(prompt)
 
         # get embedded representation of our data
-        x_embed = self.clip.text_encoder.token_embedding(x.unsqueeze(0))
+        x_embed = self.clip.text_model.embeddings.token_embedding(x.unsqueeze(0))
 
         # get global representation that result from passing it into multiple TransformerEncoder blocks
         features = self.clip.encode_text(x.unsqueeze(0), attention_mask = attention_mask.unsqueeze(0))
@@ -136,7 +136,7 @@ class HandlePrompt(nn.Module):
         # normalize embeddings for more stable trainings
         x = self.norm(x_embed.float(), features)
 
-        return x, attention_mask
+        return x
     
 class FiLM(nn.Module):
     def __init__(self, cond_dim: int):

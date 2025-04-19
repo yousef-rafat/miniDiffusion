@@ -17,6 +17,7 @@ effects = v2.Compose([
     v2.RandomRotation(degrees=(0, 60)),
     v2.RandomHorizontalFlip(),
     v2.RandomPerspective(distortion_scale = 0.4, p = 0.6),
+    v2.Resize(size = (256, 256)), # for vae
     ToTensor()
 ])
 
@@ -75,8 +76,6 @@ class ImageDataset(IterableDataset):
                 if self.transforms:
                     image = self.transforms(image)
 
-                # normalize
-                image = image.float() / 255.0
                 image = image.expand(3, -1, -1) # turn to RGB
 
                 _, _, latent = self.vae.encode(image) # turn to latent space

@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 
 class PagedAttention(nn.Module):
-    def __init__(self, heads: int, embedding_size: int, dropout: float, page_size: int = 512, max_pages: int = 16):
+    def __init__(self, heads: int, embedding_size: int, dropout: float = 0.1, page_size: int = 512, max_pages: int = 16):
         """
         Creates a Paged KV Cache Attention Mechanisim
         """

@@ -15,6 +15,8 @@ def train(device: Optional[str], train_dataset: Optional[str], eval_dataset: Opt
           euler: bool = False, log: bool = True):
 
     model = DiT(embedding_size = 512, heads = 8, depth = 10).to(device = device)
+
+    torch.set_default_dtype(torch.bfloat16)
     torch.manual_seed(2025)
 
     # turn fused only on when gpu is available

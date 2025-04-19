@@ -33,22 +33,21 @@ def get_ground_truth_velocity(image: torch.Tensor, noise: torch.Tensor, alpha_t)
     v_t = (a_t * image + b_t * noise) / torch.sqrt(a_t**2 + b_t**2)
     return v_t
 
-def compute_clip_loss(clip, generated_image, input_ids, attention_mask, size: int):
+def compute_clip_loss(clip, generated_image, input_ids):
     " compute the contrasive loss between text and generated image "
 
-    # adjut image size (important in case of rounding dimensions in VAE)
-    clip.adjust_image_size(size)
-
     # get logits
-    logits = clip(generated_image, input_ids, attention_mask)
+    logits = clip(generated_image.float(), input_ids.float())
 
-    if logits.size(0) < 2: raise ValueError("clip loss requires at least two samples in batch")
+    #if logits.size(0) < 2: raise ValueError("clip loss requires at least two samples in batch")
     
     labels = torch.arange(logits.size(0), device = logits.device).long()
-
+    print(logits.size())
+    print(labels.size())
+    print(logits)
     # compute the loss in two ways
-    loss_i2t = nn.CrossEntropyLoss()(logits, labels) # image to text
-    loss_t2i = nn.CrossEntropyLoss()(logits.t(), labels) # text to image
+    loss_i2t = nn.CrossEntropyLoss()(logits, labels.float()) # image to text
+    loss_t2i = nn.CrossEntropyLoss()(logits.t(), labels.float()) # text to image
 
     # average the two losses
     loss = (loss_i2t + loss_t2i) / 2
@@ -56,16 +55,30 @@ def compute_clip_loss(clip, generated_image, input_ids, attention_mask, size: in
     return loss
 
 def test_clip_loss():
-    label = "cats have friends"#torch.rand(2, 512)
-    image = torch.rand(2, 3, 222, 222)
+    label = "cat"#torch.rand(2, 512)
+    fake = "dog"
+    from PIL import Image
+    from torchvision.transforms import ToTensor
+    from torchvision.transforms.v2 import Resize
+    import os
+ 
+    image_path = os.path.join(os.getcwd(), "assets", "cat.webp")
+    image = Image.open(image_path).convert("RGB")
+
+    image = Resize(size=(222, 222))(image)
+    image = ToTensor()(image).unsqueeze(0)
     
     from model.clip import CLIP
     from model.dit_components import HandlePrompt
 
-    label, attention_mask = HandlePrompt()(label)
-    label = label.long().permute(1, 0, 2).expand(2, -1, -1)
-    attention_mask = attention_mask.unsqueeze(0).expand(2, -1)
+    label = HandlePrompt()(label)
+    fake = HandlePrompt()(fake)
+    print(label.size())
     
-    loss = compute_clip_loss(clip = CLIP(),generated_image = image, input_ids = label, attention_mask = attention_mask, size = image.size(-1)) #torch.zeros_like(label)
+    loss = compute_clip_loss(clip = CLIP(),generated_image = image, input_ids = label)
+    fake_loss = compute_clip_loss(clip = CLIP(),generated_image = image, input_ids = fake)
 
     print(loss)
+    print(fake_loss)
+
+test_clip_loss()
