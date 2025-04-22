@@ -7,6 +7,9 @@ import torch.nn.functional as F
 from tokenizer import TorchTokenizer
 from torchvision.transforms.v2 import Resize
 
+class QuickGELU(nn.Module):
+    def forward(self, x: torch.Tensor):
+        return x * torch.sigmoid(1.702 * x)
 class TextEncoder(nn.Module):
     def __init__(self, embed_dim: int = 512):
         super(TextEncoder, self).__init__()
@@ -18,35 +21,35 @@ class TextEncoder(nn.Module):
         # tokenizer's context_length must be set to 77 tokens
         self.embeddings.position_embedding = nn.Embedding(77, embed_dim) # 77 = context length
 
-        self.encoder = Encoder(embed_size = embed_dim)
+        self.encoder = Encoder(embed_size = embed_dim, text = True)
 
         self.final_layer_norm = nn.LayerNorm(embed_dim)
 
-    def forward(self, x: torch.Tensor, attention_mask: torch.Tensor):
+    def forward(self, text: torch.Tensor, attention_mask: torch.Tensor, return_hidden: bool = False):
 
-        x = self.embeddings.token_embedding(x.long())
+        x = self.embeddings.token_embedding(text.long())
 
         #                       seq_length
         positions = torch.arange(x.size(1))
         pos_embed = self.embeddings.position_embedding(positions)
 
-        x += pos_embed
+        x += pos_embed.to(x.dtype).to(x.device)
 
         # obtain text embeddings
         x = x.permute(1, 0, 2)
         x = self.encoder(x, attention_mask)
         x = x.permute(1, 0, 2)
+        
+        # for debugging
+        if return_hidden:
+            return x
 
         # ensure batch dim
         if x.dim() == 2: x = x.unsqueeze(0)
         if attention_mask.dim() == 1: attention_mask = attention_mask.unsqueeze(0)
 
-        # get the length of the valid tokens (non padded)
-        token_lens = attention_mask.sum(dim = 1)
-        # get the last token so we can get EOS token
-        inds = token_lens - 1
-        # for each batch, get the last token
-        x = x[torch.arange(x.size(0)), inds]
+        # for each batch, get the last token (eos)
+        x = x[torch.arange(x.size(0)), text.argmax(dim = -1)]
 
         return self.final_layer_norm(x)
     
@@ -64,14 +67,15 @@ class AttentionPool2d(nn.Module):
         if output_dim is None: self.out_proj = nn.Linear(embed_dim, embed_dim)
         else: self.out_proj = nn.Linear(embed_dim, output_dim)
 
-    def forward(self, x, src_pad_key = None, text = False):
+    def forward(self, x, src_pad_key = None, use_self_attention: bool = True):
 
         # ensure (seq_len, B, embed_dim)
         if x.shape[0] == 1:
             x = x.permute(1, 0, 2)
 
-        if text: query = x
-        else: query = x[:1]
+        if use_self_attention: 
+            query = x
+        else: query = x[:1] # pooled attention
 
         x, _ = F.multi_head_attention_forward(
             query = query, key = x, value = x,
@@ -102,7 +106,7 @@ class MLP(nn.Module):
 
         self.fc1 = nn.Linear(embed_size, embed_size * ratio)
         self.fc2 = nn.Linear(embed_size * ratio, embed_size)
-        self.gelu = nn.GELU()
+        self.gelu = QuickGELU()
 
     def forward(self, x: torch.Tensor):
 
@@ -113,33 +117,39 @@ class MLP(nn.Module):
         return x
     
 class EncoderLayer(nn.Module):
-    def __init__(self, embed_size: int = 768, ratio: int = 4, num_heads: int = 8):
+    def __init__(self, embed_size: int = 768, ratio: int = 4, num_heads: int = 12, text: bool = False):
         super().__init__()
 
         self.layer_norm1 = nn.LayerNorm(embed_size)
         self.layer_norm2 = nn.LayerNorm(embed_size)
         self.mlp = MLP(embed_size = embed_size, ratio = ratio)
 
-        self.self_attn = AttentionPool2d(num_heads = num_heads, embed_dim = embed_size)
+        if text: self.self_attn = AttentionPool2d(num_heads = 8, embed_dim = 512)
+        else: self.self_attn = AttentionPool2d(num_heads = num_heads, embed_dim = embed_size)
 
     def forward(self, x: torch.Tensor, src_pad_key = None):
         
-        if src_pad_key is not None: attn_out = self.self_attn(x, src_pad_key = src_pad_key, text = True)
-        else: attn_out = self.self_attn(x)
+        residual = x
+        x = self.layer_norm1(x)
+        
+        if src_pad_key is not None: x = self.self_attn(x, src_pad_key = src_pad_key, use_self_attention = True)
+        else: x = self.self_attn(x)
 
         # normalize and apply residual connections
-        x = self.layer_norm1(x)
-        x += attn_out
+        x += residual
+
+        residual = x
         x = self.layer_norm2(x)
-        x += self.mlp(x)
+        x = self.mlp(x)
+        x += residual
 
         return x
 
 class Encoder(nn.Module):
-    def __init__(self, embed_size = 768):
+    def __init__(self, embed_size = 768, text = False):
         super().__init__()
 
-        self.layers = nn.ModuleList([EncoderLayer(embed_size = embed_size) for _ in range(12)])
+        self.layers = nn.ModuleList([EncoderLayer(embed_size = embed_size, text = text) for _ in range(12)])
 
     def forward(self, x: torch.Tensor, attention_mask = None):
 
@@ -173,9 +183,10 @@ class ImageEncoder(nn.Module):
         self.post_layernorm = nn.LayerNorm(project_dim)
 
     def forward(self, x: torch.Tensor):
+
+        if x.dim() == 5: x = x.squeeze(0) # remove extra dim if there
         
         # output: (B, embed_dim, H_, W_)
-        if x.dim() == 5: x = x.squeeze(0)
         x = self.embeddings.patch_embedding(x)
         x = x.flatten(2) # (B, embed_dim, HW)
 
@@ -188,7 +199,7 @@ class ImageEncoder(nn.Module):
         positions = torch.arange(x.size(1), device = x.device)
         pos_embed = self.embeddings.position_embedding(positions)
 
-        x += pos_embed
+        x += pos_embed.to(x.dtype).to(x.device)
 
         x = self.pre_layrnorm(x)
 
@@ -261,7 +272,7 @@ def load_clip(model: CLIP, device = "cpu"):
 
     clip_path = os.path.join(os.getcwd(), "encoders", "hub", "checkpoints", "clip_model.pth")
     missing, unexpected = model.load_state_dict(torch.load(clip_path, map_location = device), strict = True)
-
+    
     # for debuggging
     if len(missing) != 0:
         print(f"Missing keys ({len(missing)}):", missing)
@@ -274,7 +285,6 @@ def load_clip(model: CLIP, device = "cpu"):
 def test_clip():
 
     from PIL import Image
-    from torchvision.transforms import ToTensor
 
     from torchvision import transforms
     preprocess = transforms.Compose([
@@ -306,7 +316,12 @@ def test_clip():
     # same for dog
     ids2 = model.encode_text("a photo of a dog")
     logit2 = model(image, ids2)
+    
     print("Dog similarity:", logit2)
+
+    from torch.nn.functional import cosine_similarity
+
+    print("cosine cat/dog:", cosine_similarity(ids, ids2, dim=-1).item())
 
 if __name__ == "__main__":
     test_clip()
