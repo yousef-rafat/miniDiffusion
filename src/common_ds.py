@@ -8,9 +8,9 @@ from model.vae import VAE
 import matplotlib.pyplot as plt
 from model.noise import NoiseScheduler 
 import torchvision.transforms.v2 as v2
+from model.tokenizer import TorchTokenizer
 from torchvision.transforms import ToTensor
 from torchvision.datasets import ImageFolder
-from model.dit_components import HandlePrompt
 from torch.utils.data import IterableDataset, DataLoader 
 
 effects = v2.Compose([
@@ -47,7 +47,7 @@ class ImageDataset(IterableDataset):
         self.transforms = transforms
         self.scheduler = NoiseScheduler(beta = 0.9, timesteps = 10)
         self.make_trainable = OptimizeImage()
-        self.prompt_handle = HandlePrompt()
+        self.tokenizer = TorchTokenizer()
         self.vae = VAE()
 
         self.batch_size = batch
@@ -71,14 +71,15 @@ class ImageDataset(IterableDataset):
                 image = Image.open(image_path)
 
                 label = self.labels[label_idx]
-                input_ids, attention_mask = self.prompt_handle(label)
+                input_ids, attention_mask = self.tokenizer.tokenize(label)
 
                 if self.transforms:
                     image = self.transforms(image)
 
-                image = image.expand(3, -1, -1) # turn to RGB
+                image = image.expand(3, -1, -1).unsqueeze(0) # turn to RGB
 
-                _, _, latent = self.vae.encode(image) # turn to latent space
+                latent_dist = self.vae.encode(image) # turn to latent space
+                latent = latent_dist.sample() 
 
                 noise, _ = self.scheduler.add_noise(latent.unsqueeze(0))
 
@@ -176,7 +177,7 @@ def test_fashion():
     train_dataset, _ = get_fashion_mnist_dataset()
 
     for batch in train_dataset: # (_, _, image, label, _)
-        image = batch[0][2]
+        image = batch[0][2].squeeze(0).squeeze(0)
         label = batch[0][3]
 
         plt.figure()

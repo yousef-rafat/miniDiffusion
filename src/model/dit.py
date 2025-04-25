@@ -112,22 +112,6 @@ class DiT(nn.Module):
         output = depatchify(x)
 
         return output
-    
-    def generate(self, solver_fn, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
-
-        """  Generates an image given text input (input_ids, attention_mask).  """
-
-        self.eval() 
-        with torch.no_grad():
-            
-            t = torch.rand(1, 1, device = input_ids.device)
-            
-            latent = torch.randn(1, 4, 28, 28, device = input_ids.device)  # Initial latent space
-            velocity = self(latent = latent, input_ids = input_ids, attention_mask = attention_mask, t = t)
-            
-            generated_image = solver_fn(velocity, t)
-            
-        return generated_image
 
 def test_dit():
 

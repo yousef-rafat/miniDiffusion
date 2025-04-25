@@ -2,9 +2,7 @@ import math
 import torch
 import torch.nn as nn
 from torch import Tensor
-from model.clip import CLIP
 import torch.nn.functional as F
-from model.tokenizer import TorchTokenizer
 
 def patchify(x: Tensor, size: int, stride = None):
     " Turn a latent into patches "
@@ -47,28 +45,6 @@ def depatchify(x: Tensor) -> torch.Tensor:
 
     return x
         
-class ConditionalPromptNorm(nn.Module):
-    # normalization with Feed-Forward layer for text prompts
-    # should be encoded with clip
-    def __init__(self, hidden_size: int, dim: int):
-        super(ConditionalPromptNorm, self).__init__()
-
-        # normalization
-        # elementwise_affine will put biases into zeros and weights into ones
-        # and make them trainable
-        self.norm = nn.LayerNorm(hidden_size, elementwise_affine = True)
-        # FF layer
-        self.fcw = nn.Linear(dim, hidden_size)
-        self.fcb = nn.Linear(dim, hidden_size)
-
-    def forward(self, x: Tensor, features):   
-        bs = x.size(0) # batch size
-
-        out = self.norm(x)
-        w = self.fcw(features).reshape(bs, 1, -1)
-        b = self.fcb(features).reshape(bs, 1, -1)
-
-        return  w * out + b
 
 class RotaryPositionalEncoding(nn.Module):
     def __init__(self, d_model, max_seq_len = 196, device = 'cpu', dropout = 0.1):
@@ -112,31 +88,6 @@ class RotaryPositionalEncoding(nn.Module):
         x = torch.matmul(x, self.rotation_matrix)
 
         return self.dropout(x)
-    
-class HandlePrompt(nn.Module):
-    # be used in training with raw string data
-    def __init__(self, hidden_size: int = 512, dim: int = 512):
-        super(HandlePrompt, self).__init__()
-
-        self.tokenizer = TorchTokenizer()
-        self.norm = ConditionalPromptNorm(hidden_size = hidden_size, dim = dim)
-        self.clip = CLIP()
-
-    def forward(self, prompt: str):
-
-        # tokenize input
-        x, attention_mask = self.tokenizer.tokenize(prompt)
-
-        # get embedded representation of our data
-        x_embed = self.clip.text_model.embeddings.token_embedding(x.unsqueeze(0))
-
-        # get global representation that result from passing it into multiple TransformerEncoder blocks
-        features = self.clip.encode_text(x.unsqueeze(0), attention_mask = attention_mask.unsqueeze(0))
-
-        # normalize embeddings for more stable trainings
-        x = self.norm(x_embed.float(), features)
-
-        return x
     
 class FiLM(nn.Module):
     def __init__(self, cond_dim: int):

@@ -7,8 +7,9 @@ class NoiseScheduler(torch.nn.Module):
         super(NoiseScheduler, self).__init__()
 
         self.beta = beta
+        # shift normal dist left or right
         self.mu = mu
-        # control shape of logit-normal distrubition
+        # control shape of logit-normal distrubition (standard deviation)
         self.sigma = sigma
 
         self.timesteps = timesteps
@@ -17,6 +18,28 @@ class NoiseScheduler(torch.nn.Module):
         # alpha bar represents our mean
         # refrence equation: https://miro.medium.com/v2/resize:fit:242/format:webp/1*nIl1f0BYyqXM3TIDHHUaWg.png
         self.alpha_bar = torch.cumprod(self.alphas, dim = 0) #cumulative product
+
+        # For Inference
+        #////////////////////////////////////////////////////////////
+
+        # discrete timesteps for inference
+        self.sigmas = torch.sqrt((1 - self.alpha_bar) / self.alpha_bar)
+
+    def sigma_scheduler(self, num_inference_steps):
+
+        # check if the first element is inifinity, and if so skip it
+        # culprit: torch.log(0) = inf
+        if torch.isinf(self.sigmas[0]) and self.sigmas[0] > 0:
+            sigmas = self.sigmas[:1]
+        else: sigmas = self.sigmas
+
+        log_s = torch.log(sigmas)
+        idxs = torch.linspace(0, sigmas.size(0) - 1, num_inference_steps, device = log_s.device).long()
+        
+        # add a zero at the end to reach the data distribution
+        sigmas = torch.cat([sigmas[idxs], torch.zeros(1, device = idxs.device)])
+
+        return sigmas
 
     def check_timestep(self, timestep: int):
         # check if timestep is valid
@@ -39,7 +62,6 @@ class NoiseScheduler(torch.nn.Module):
         return weighted_sampled_t
         
 
-
     def add_noise(self, image: torch.Tensor,  timestep: int = None):
 
         """
@@ -55,7 +77,7 @@ class NoiseScheduler(torch.nn.Module):
 
         # rand_like will use uniform random numbers to generate noise
         # that will fit the image's dimensions
-        noise = torch.rand_like(image.float())
+        noise = torch.randn_like(image.float())
         noised_image = torch.sqrt(self.alpha_bar[timestep]) * image + noise * torch.sqrt(1 - self.alpha_bar[timestep])
 
         # returning noise is helpful for training
@@ -135,13 +157,23 @@ class NoiseScheduler(torch.nn.Module):
 def test_noise():
 
     import os
-    import torchvision.io as io
+    from PIL import Image
+    from torchvision.transforms import ToTensor
 
-    image_dir = os.path.join(os.getcwd(), "assets", "dog.png")
-    image = io.read_image(image_dir)
+    image_dir = os.path.join(os.getcwd(), "assets", "cat.png")
+    image = Image.open(image_dir)
+
+    image = ToTensor()(image)
     
     noiser = NoiseScheduler(0.9, 10)
     noised_image, _ = noiser.add_noise(image = image.unsqueeze(0))
     
-    print(noised_image)
-    # TODO: save image and check noise
+    import matplotlib.pyplot as plt
+
+    plt.figure()
+    plt.imshow(noised_image.squeeze(0).permute(1, 2, 0).numpy())
+    plt.axis("off")
+    plt.show()
+
+if __name__ == "__main__":
+    test_noise()

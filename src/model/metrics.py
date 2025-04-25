@@ -46,7 +46,6 @@ class FID(nn.Module):
 
         # normalize images
         gn_img = gn_img / 255.0
-        rl_img = rl_img / 255.0
 
         with torch.no_grad():
             gen_features = self.model(gn_img)

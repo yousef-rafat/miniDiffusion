@@ -4,7 +4,7 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from tokenizer import TorchTokenizer
+from model.tokenizer import TorchTokenizer
 from torchvision.transforms.v2 import Resize
 
 class QuickGELU(nn.Module):
@@ -264,7 +264,23 @@ class CLIP(nn.Module):
         with torch.no_grad():
             text_emb = self.text_model(input_ids.long(), attention_mask)
 
-        return text_emb
+        text_features = self.text_projection(text_emb)
+
+        text_features = F.normalize(text_features, dim=-1)
+
+        return text_features, attention_mask
+    
+    def encode_image(self, image: torch.Tensor):
+
+        # same as the forward but only for the image
+        
+        image_features = self.vision_model(image)
+
+        image_features = self.visual_projection(image_features)
+
+        image_features = F.normalize(image_features, dim=-1)
+
+        return image_features
 
 def load_clip(model: CLIP, device = "cpu"):
 
@@ -307,14 +323,14 @@ def test_clip():
 
     model = load_clip(model)
 
-    ids = model.encode_text("a photo of a cat")
+    ids, _ = model.encode_text("a photo of a cat")
 
     # run forward
     logit = model(image, ids) 
     print("Cat similarity:", logit)
 
     # same for dog
-    ids2 = model.encode_text("a photo of a dog")
+    ids2, _ = model.encode_text("a photo of a dog")
     logit2 = model(image, ids2)
     
     print("Dog similarity:", logit2)
