@@ -4,7 +4,7 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from model.tokenizer import TorchTokenizer
+from tokenizer import TorchTokenizer
 from torchvision.transforms.v2 import Resize
 
 class QuickGELU(nn.Module):

@@ -1,17 +1,31 @@
 import torch
 import torch.nn as nn
-
-class PagedAttention(nn.Module):
-    def __init__(self, heads: int, embedding_size: int, dropout: float = 0.1, page_size: int = 512, max_pages: int = 16):
+from collections import deque
+from dit_components import RMSNorm
+class PagedJointAttention(nn.Module):
+    def __init__(self, heads: int, embedding_size: int, dropout: float = 0.1, page_size: int = 512, max_pages: int = 16, 
+                batch_size: int = 1):
         """
         Creates a Paged KV Cache Attention Mechanisim
         """
-        super(PagedAttention, self).__init__()
+        super(PagedJointAttention, self).__init__()
 
         self.heads = heads
         self.embedding_size = embedding_size
         self.page_size = page_size
         self.max_pages = max_pages
+        self.max_tokens = max_pages * page_size
+
+        # normalization
+        self.norm_q = RMSNorm(embedding_size)
+        self.norm_k = RMSNorm(embedding_size)
+        self.norm_added_q = RMSNorm(embedding_size)
+        self.norm_added_k = RMSNorm(embedding_size)
+
+        self.to_out = nn.ModuleList([
+            nn.Linear(embedding_size, embedding_size),
+            nn.Dropout(dropout)
+        ])
 
         # avoid error
         self.batch_first = False
@@ -19,24 +33,30 @@ class PagedAttention(nn.Module):
         assert embedding_size % heads == 0, "embedding size must be divisible by heads"
         self.head_dim = embedding_size // heads
 
-        self.dropout_layer = nn.Dropout(dropout)
+        self.to_q = nn.Linear(embedding_size, embedding_size)
+        self.to_k = nn.Linear(embedding_size, embedding_size)
+        self.to_v = nn.Linear(embedding_size, embedding_size)
 
-        self.q_linear = nn.Linear(embedding_size, embedding_size)
-        self.k_linear = nn.Linear(embedding_size, embedding_size)
-        self.v_linear = nn.Linear(embedding_size, embedding_size)
+        # for joint attention
+        self.add_q_proj = nn.Linear(embedding_size, embedding_size)
+        self.add_k_proj = nn.Linear(embedding_size, embedding_size)
+        self.add_v_proj = nn.Linear(embedding_size, embedding_size)
 
-        self.out_linear = nn.Linear(embedding_size, embedding_size)
+        self.to_add_out = nn.Linear(embedding_size, embedding_size)
 
-        # KV Cache Storage (Paged)
-        self.kv_cache = []  # Stores (K, V) pages
+        self.k_cache = deque(maxlen = self.max_pages)
+        self.v_cache = deque(maxlen = self.max_pages)
 
     # key and value equal None to compliy with PyTorch's api
-    def forward(self, x: torch.Tensor, key = None, value = None, attn_mask = None, use_cache: bool = True, key_padding_mask: torch.Tensor = None, **kwargs):
+    def forward(self, x: torch.Tensor, key = None, value = None, attn_mask = None, use_cache: bool = True, key_padding_mask: torch.Tensor = None, 
+                encoder_hidden_state: torch.Tensor = None, **kwargs):
         # reference attention equation
         # https://pbs.twimg.com/profile_images/1624054272676532224/UNv4ONME_400x400.jpg
 
         if key is None: key = x
         if value is None: value = x
+
+        residual = x
 
         # handle padding tokens
         if key_padding_mask is not None:
@@ -47,9 +67,9 @@ class PagedAttention(nn.Module):
 
         batch_size, seq_length, _ = x.size()
 
-        Q = self.q_linear(x)
-        new_K = self.k_linear(x)
-        new_V = self.v_linear(x)
+        Q = self.to_q(x)
+        new_K = self.to_k(x)
+        new_V = self.to_v(x)
 
         # Reshape for multi-head attention
         Q = Q.view(batch_size, seq_length, self.heads, self.head_dim).permute(0, 2, 1, 3)
@@ -60,9 +80,37 @@ class PagedAttention(nn.Module):
         if use_cache:
             self.store_in_cache(new_K, new_V)
 
+            # get the previous K and V for complete context
             K, V = self.get_cached_kv()
         else:
             K, V = new_K, new_V 
+
+        # normalize query and key
+        print(Q.size())
+        Q = self.norm_q(Q)
+        K = self.norm_k(K)
+
+        # the Joint Attention part
+        if encoder_hidden_state is not None:
+            
+            # forward pass with reshaping 
+            encoder_query = self.add_q_proj(encoder_hidden_state)\
+                .view(batch_size, -1, self.heads, self.head_dim).transpose(1, 2) # (B, seq_len, heads, heads_dim)
+            
+            encoder_key = self.add_k_proj(encoder_hidden_state)\
+                .view(batch_size, -1, self.heads, self.head_dim).transpose(1, 2) # //
+            
+            encoder_value = self.add_v_proj(encoder_hidden_state)\
+                .view(batch_size, -1, self.heads, self.head_dim).transpose(1, 2) # //
+            
+            # normalize
+            encoder_query = self.norm_added_q(encoder_query)
+            encoder_key = self.norm_added_k(encoder_key)
+
+            # concat the attentions
+            Q = torch.concat([Q, encoder_query], dim = 2)
+            K = torch.concat([K, encoder_key], dim = 2)
+            V = torch.concat([V, encoder_value], dim = 2)
 
         # compute attention, reference above
         try: scores = torch.matmul(Q, K.transpose(-2, -1)) / (self.head_dim ** 0.5)
@@ -81,42 +129,56 @@ class PagedAttention(nn.Module):
         
         attention = torch.softmax(scores, dim = -1)
 
-        attention = self.dropout_layer(attention)
+        #attention = self.dropout_layer(attention)
         output = torch.matmul(attention, V)
 
         # (batch_size, seq_length, embedding_size)
         seq_length = output.size(2)
         out = output.permute(0, 2, 1, 3).contiguous().view(batch_size, seq_length, self.embedding_size)
 
-        return self.out_linear(out)
+        # split hidden_states and encoder hidden states
+        if encoder_hidden_state is not None:
+            hidden_states, encoder_hidden_states = (
+                out[:, :residual.size(1)],
+                out[:, residual.size(1):]
+            )
 
-    def store_in_cache(self, K, V):
-        """Stores K and V in paged memory format."""
-        for i in range(K.shape[2]):  # Iterate over sequence length
-            token_K = K[:, :, i, :]  # Select token K across batch & heads
-            token_V = V[:, :, i, :]  # Select token V
+            encoder_hidden_states = self.to_add_out(encoder_hidden_states)
 
-            if len(self.kv_cache) >= self.max_pages * self.page_size:
-                # if cache exceeds max capacity, remove the oldest entry
-                # FIFO
-                self.kv_cache.pop(0)
+        # linear + dropout
+        for layer in self.to_out:
+            hidden_states = layer(hidden_states)
 
-            self.kv_cache.append((token_K, token_V))  # Store as a new entry
+        if encoder_hidden_state is None: return hidden_states
+
+        else: return hidden_states, encoder_hidden_states
+
+    def store_in_cache(self, K_new: torch.Tensor, V_new: torch.Tensor):
+        """
+        Splits incoming K/V by pages of size `page_size` and appends each chunk to deques.
+        """
+
+        k_chunks = torch.split(K_new, self.page_size, dim = 2)
+        v_chunks = torch.split(V_new, self.page_size, dim = 2)
+
+        for k_chunk, v_chunk in zip(k_chunks, v_chunks):
+            self.k_cache.append(k_chunk)
+            self.v_cache.append(v_chunk)
 
     def get_cached_kv(self):
-        """Retrieves stored KV pairs and returns as tensors."""
-        if not self.kv_cache:
-            return None, None  # Empty cache case
-
-        K_list, V_list = zip(*self.kv_cache)  # Unpack stored KV pairs
-        K = torch.cat(K_list, dim=-2)  # Stack along sequence axis
-        V = torch.cat(V_list, dim=-2)
-
+        """
+        Concatenate all cached pages along sequence dim to form full K and V.
+        """
+        if not self.k_cache:
+            return None, None
+        K = torch.cat(list(self.k_cache), dim=2)
+        V = torch.cat(list(self.v_cache), dim=2)
         return K, V
 
     def reset_cache(self):
-        """clears stored KV cache."""
-        self.kv_cache = []
+        """Clear all cached pages."""
+        self.k_cache.clear()
+        self.v_cache.clear()
 
     def __del__(self):
         super()
@@ -127,7 +189,7 @@ class PagedTransformerEncoderLayer(nn.TransformerEncoderLayer):
     def __init__(self, embed_dim, num_heads, dim_feedforward: int = 2048, dropout = 0.1):
         # dim_feedforward = number of hidden features in FFN
         super().__init__(embed_dim, num_heads, dim_feedforward, dropout)
-        self.self_attn = PagedAttention(heads = num_heads, embedding_size = embed_dim, dropout = dropout)
+        self.self_attn = PagedJointAttention(heads = num_heads, embedding_size = embed_dim, dropout = dropout)
 
 def test_atten(embed_dim = 512):
     x = torch.rand(1024, embed_dim)
@@ -136,3 +198,6 @@ def test_atten(embed_dim = 512):
     output = model(x.unsqueeze(0), src_key_padding_mask = key_padding_mask)
     print(output)
     del model
+
+if __name__ == "__main__":
+    test_atten()

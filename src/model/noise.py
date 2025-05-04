@@ -75,7 +75,7 @@ class NoiseScheduler(torch.nn.Module):
 
         self.check_timestep(timestep)
 
-        # rand_like will use uniform random numbers to generate noise
+        # randn_like will create the guassian noise
         # that will fit the image's dimensions
         noise = torch.randn_like(image.float())
         noised_image = torch.sqrt(self.alpha_bar[timestep]) * image + noise * torch.sqrt(1 - self.alpha_bar[timestep])

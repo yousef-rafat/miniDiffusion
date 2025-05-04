@@ -84,7 +84,7 @@ def train(device: Optional[str], train_dataset: Optional[str], eval_dataset: Opt
 
         generated_image = vae.decode(denoised_latent.detach())
 
-        clip_loss = compute_clip_loss(clip, generated_image, input_ids, attention_mask, size = generated_image.size(-1))
+        clip_loss = compute_clip_loss(clip, generated_image, input_ids)
         loss += clip_loss
 
         return loss, generated_image

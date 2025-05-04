@@ -2,7 +2,9 @@ import math
 import torch
 import torch.nn as nn
 from torch import Tensor
-import torch.nn.functional as F
+from clip import CLIP
+#from t5_encoder import T5EncoderModel
+from tokenizer import TorchTokenizer, UnigramTokenizer
 
 def patchify(x: Tensor, size: int, stride = None):
     " Turn a latent into patches "
@@ -44,71 +46,155 @@ def depatchify(x: Tensor) -> torch.Tensor:
     x = x.view(batch, channels, img_size, img_size) 
 
     return x
-        
 
-class RotaryPositionalEncoding(nn.Module):
-    def __init__(self, d_model, max_seq_len = 196, device = 'cpu', dropout = 0.1):
-        super(RotaryPositionalEncoding, self).__init__()
+class HandlePrompt(nn.Module):
+    def __init__(self):
+        super().__init__()
 
-        assert d_model % 2 == 0, "d_model must be even for RoPE"
+        self.clip_tokenizer = TorchTokenizer()
+        self.t5_tokenizer = UnigramTokenizer()
+    
+    def forward(self, x: torch.Tensor, clip: CLIP, t5_encoder): # return T5EncoderModel later
 
-        self.dropout = nn.Dropout(p = dropout)
+        clip_tokens = self.clip_tokenizer.tokenize(x)
+        t5_tokens = self.t5_tokenizer.encode(x)
 
-        # Create a rotation matrix.
-        self.rotation_matrix = torch.zeros(d_model, d_model, device = device)
-        for i in range(d_model):
-            for j in range(d_model):
-                position = torch.tensor(i * j * 0.01)
-                self.rotation_matrix[i, j] = torch.cos(position)
+        clip_embeds = clip.encode_text(clip_tokens)
+        t5_embeds = t5_encoder(t5_tokens)
 
-        # Create a positional embedding matrix.
-        self.positional_embedding = torch.zeros(max_seq_len, d_model, device = device)
-        for i in range(max_seq_len):
-            for j in range(d_model):
-                position = torch.tensor(i * j * 0.01)
-                self.positional_embedding[i, j] = torch.cos(position)
+        return clip_embeds, t5_embeds
+    
+class TimeStepEmbeddings(nn.Module):
+    def __init__(self, in_features: int = 256, out_features: int = 2432):
+        super().__init__()
+
+        self.linear_1 = nn.Linear(in_features, out_features)
+        self.act = nn.SiLU()
+        self.linear_2 = nn.Linear(out_features, out_features)
+
+    def forward(self, x: Tensor) -> Tensor:
+
+        x = self.linear_1(x)
+        x = self.act(x)
+        return self.linear_2(x)
+    
+class PixArtAlphaTextProjection(TimeStepEmbeddings):
+    def __init__(self, in_features = 2048, out_features = 2432):
+        super().__init__(in_features, out_features)
+
+class AdaLayerNormContinuous(nn.Module):
+    """ Modulate Image Features With Text Features """
+    def __init__(self, embed_dim: int = 2432):
+        super().__init__()
+
+        self.silu = nn.SiLU()
+        # linearly project it so we can split into scale and shift later
+        self.linear = nn.Linear(embed_dim, embed_dim * 2)
+        self.norm = nn.LayerNorm(embed_dim)
+
+    def forward(self, x, cond_embed):
+
+        embed = self.silu(cond_embed)
+        embed = self.linear(embed)
+        # how to much to scale and shift each channel
+        scale, shift = torch.chunk(embed, 2, dim = 1)
+
+        # normalize input and multipled with scale and shift (after adding a new second dimension)
+        x = self.norm(x) * (1 + scale)[:, None, :] + shift[:, None, :]
+
+        return x
+    
+class AdaLayerNormZero(AdaLayerNormContinuous):
+    def __init__(self, in_features = 2432, out_features = 14592):
+        super().__init__(in_features, out_features)
 
     def forward(self, x):
-        """ applies rotational encoding """
+
+        emb = self.linear(self.silu(x))
+
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = emb.chunk(6, dim=1)
+        x = self.norm(x) * (1 + scale_msa[:, None]) + shift_msa[:, None]
+
+        return x, gate_msa, shift_mlp, scale_mlp, gate_mlp
     
-        try: x += self.positional_embedding
-        except RuntimeError:
+class FeedForward(nn.Module):
+    def __init__(self, dim: int = 2432, dropout_rate: float = 0.0):
+        super().__init__()
 
-            # interpolate dimensions to be compatiable with x
-            pos_emb_resized = F.interpolate(
-                self.positional_embedding.unsqueeze(0).permute(0, 2, 1),  # [1, 512, 196]
-                size = x.size(1),
-                mode = "linear",
-                align_corners = False
-            ).permute(0, 2, 1)  # turn to [1, 784, 512]
+        hidden_dim = dim * 4
+        self.net = nn.ModuleList([
+            nn.Sequential(
+                nn.GELU(),
+                nn.Linear(dim, hidden_dim)
+            ),
+            nn.Dropout(dropout_rate),
+            nn.Linear(hidden_dim, dim)
+        ])
 
-            x += pos_emb_resized
 
-        # Apply the rotation matrix to the input tensor.
-        x = torch.matmul(x, self.rotation_matrix)
+    def forward(self, x):
+        
+        for layer in self.net:
+            x = layer(x)
 
-        return self.dropout(x)
+        return x
     
-class FiLM(nn.Module):
-    def __init__(self, cond_dim: int):
+class PatchEmbed(nn.Module):
+    def __init__(self, in_channels: int = 16, out_channels: int = 2432, kernel_size: int = 2, stride: int = 2):
+        self.proj = nn.Conv2d(in_channels, out_channels, kernel_size = kernel_size, stride = stride, bias = False)
+    def forward(self, x):
+        return self.proj(x)
+    
+class RMSNorm(nn.Module):
+    """ RMSNorm Norm Implementation (different from nn.LayerNorm) """
+    def __init__(self, hidden_size: int):
+        super().__init__()
 
-        """ Affine Transformation For Input Features (text)
-            Args: cond_dim: Embedding size For Both Image And Text (dimension)
-        """
-        # cond_dim === embed_dim
+        self.weight = nn.Parameter(torch.ones(hidden_size))
+        self.eps = 1e-6
 
-        super(FiLM, self).__init__() 
-        self.film_layer = nn.Linear(cond_dim, cond_dim * 2)
+    def forward(self, hidden_states):
 
-    def forward(self, x, cond):
-        # cond: conditioned text features 
-        # return modulated features
+        variance = hidden_states.pow(2).mean(-1, keepdim = True)    
+        hidden_states *= torch.rsqrt(variance + self.eps) # 1 / sqrt(variance)
 
-        # applies film layer
-        gamma_beta = self.film_layer(cond)
-        # split gamma and beta
-        gamma, beta = torch.chunk(gamma_beta, chunks = 2, dim = -1)
+        return self.weight * hidden_states
+    
+def get_timestep_embeddings(timesteps: Tensor, embed_dim: int, max_period: int = 10_000, downscale_freq_shift: float = 1) -> Tensor:
+    """ Get the sin-cos time embeddings """
+    # time step embeddings for diffusion models are important as it gives
+    # diffusion models a sense of time or progression and how much noise there is
 
-        # unsqueeze to allow broadcasting
-        #return gamma.unsqueeze(1) * x + beta.unsqueeze(1)
-        return gamma * x + beta
+    assert timesteps.dim() == 1, "timesteps dimensions must be equal to one"
+
+    # split embeddings into two halves, one for sin and the other for cos
+    half_dim = embed_dim // 2
+
+    exponent = -math.log(max_period) * torch.arange(0, half_dim)
+
+    # to spread the exponents evenly
+    exponent = exponent / (half_dim - downscale_freq_shift)
+
+    emb = torch.exp(exponent)
+
+    # multiply the exponents with the timesteps
+    emb = emb[:, None] * timesteps[None, :] # to do matrix mat
+
+    #concat sin and cos embeddings
+    emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim = -1)
+
+    return emb
+
+class Timesteps(nn.Module):
+    def __init__(self, embed_dim: int):
+        super().__init__()
+        self.embed_dim = embed_dim
+    
+    def forward(self, timesteps):
+
+        time_embeddings = get_timestep_embeddings(
+            timesteps = timesteps,
+            embed_dim = self.embed_dim
+        )
+
+        return time_embeddings
