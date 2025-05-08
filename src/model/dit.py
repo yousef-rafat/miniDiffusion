@@ -1,120 +1,192 @@
 import torch
 import torch.nn as nn
-from model.attention import PagedTransformerEncoderLayer
-from model.dit_components import patchify, depatchify, RotaryPositionalEncoding, FiLM
+from model.attention import PagedJointAttention
+from model.dit_components import ( 
+    CombinedTimestepTextProjEmbeddings, PatchEmbed, AdaLayerNormContinuous, AdaLayerNormZero,
+    FeedForward, chunk_feed_forward
+)
+
+####################################################################################
+# SD3 Architecture: https://learnopencv.com/wp-content/uploads/2024/11/SD35_arch.png
+####################################################################################
+
+class DiTBlock(nn.Module):
+    def __init__(self, num_heads: int, embedding_size: int = 1536, add_context_final: bool = False, dropout_rate: float = 0.0):
+        super().__init__()
+
+        """
+        add_context_final: add special processings for the final layer in the model
+        """
+
+        self.norm_1 = AdaLayerNormZero(in_features= embedding_size)
+
+        self.final_context = add_context_final
+
+        if add_context_final:
+            self.norm1_context = AdaLayerNormContinuous(embed_dim = embedding_size)
+        else: self.norm1_context = AdaLayerNormZero(in_features = embedding_size)
+
+        self.attn = PagedJointAttention(embedding_size = embedding_size, num_heads = num_heads, dropout = dropout_rate)
+        self.ff = FeedForward(dropout_rate = dropout_rate)
+
+        # for ff layer
+        self.norm2 = nn.LayerNorm(embedding_size)
+
+        if add_context_final:
+            self.ff_context = FeedForward(dim = embedding_size)
+            self.norm2_context = nn.LayerNorm(embedding_size, elementwise_affine = False)
+        else:
+            self.ff_context = None
+            self.norm2_context = None
+
+        # TODO: figure out correct or optimized values
+        self.chunk_dim = 1
+        self.chunk_size = 256
+
+    def forward(self, hidden_states: torch.Tensor, encoder_hidden_states: torch.Tensor, time_emb: torch.Tensor, use_chunking: bool = True):
+
+        # /////////
+        # Normalize
+        # /////////
+
+        norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(hidden_states, emb = time_emb)
+        
+        if self.final_context:
+            norm_hidden_states = self.norm1_context(encoder_hidden_states)
+        else:
+            norm_encoder_hidden_states, c_gate_msa, c_shift_mlp, c_scale_mlp, c_gate_mlp = self.norm1_context(
+                encoder_hidden_states, emb = time_emb
+            )
+
+        ##############################################################################################################
+        # Attention
+        attn_output, encoder_output = self.attn(norm_hidden_states, encoder_hidden_state = norm_encoder_hidden_states)
+
+        # gated residual attention connection
+        attn_output = gate_msa.unsqueeze(1) * attn_output
+        hidden_states += attn_output
+
+        #########################################################################################################################
+        # Feed Forward
+        norm_hidden_states = self.norm2(hidden_states)
+        # scale and shift hidden states
+        norm_hidden_states = norm_hidden_states * (1 + scale_mlp[:, None]) + shift_mlp[:, None]
+
+        if use_chunking:
+            ff_output = chunk_feed_forward(self.ff, norm_hidden_states, chunk_dim = self.chunk_dim, chunk_size = self.chunk_size)
+        else:
+            ff_output = self.ff(norm_hidden_states)
+
+        ff_output = gate_mlp.unsqueeze(1) * ff_output
+        hidden_states += ff_output
+
+        #############################################################################################################################
+        # Fead Forward Context
+        if self.final_context:
+            encoder_hidden_states = None
+
+        else:
+            # apply attention mechanisim
+            encoder_output = c_gate_msa.unsqueeze(1) * encoder_output
+            encoder_hidden_states += encoder_output
+
+            # normalize and (shift and scale)
+            norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
+            norm_encoder_hidden_states = norm_encoder_hidden_states * (1 + c_scale_mlp[:, None]) + c_shift_mlp[:, None]
+
+            # apply ff context
+            if use_chunking:
+                context_ff_output = chunk_feed_forward(self.ff_context, norm_encoder_hidden_states, self.chunk_dim, self.chunk_size)
+            else: context_ff_output = self.ff_context(norm_encoder_hidden_states)
+
+            # apply gated residual connection
+            encoder_hidden_states = encoder_hidden_states + c_gate_mlp.unsqueeze(1) * context_ff_output
+
+        return hidden_states, encoder_hidden_states
 
 # MultiModal Diffiusion Transformer Block (MMDiT)
 class DiT(nn.Module):
     # reference for rectified flow: https://arxiv.org/pdf/2403.03206
-    def __init__(self, heads: int = 8, embedding_size: int = 512, patch_size: int = 8, depth: int = 5, max_length: int = 196):
+    def __init__(self, heads: int = 8, embedding_size: int = 1536, patch_size: int = 16, depth: int = 5, caption_projection_dim: int = 1152,
+                 output_channels: int = 16):
         super(DiT, self).__init__()
 
         #####################
         # Create model layers
         #####################
 
-        # module list so we can pass the attention mask for every layer
-        self.model = nn.ModuleList(
-            [PagedTransformerEncoderLayer(num_heads = heads, embed_dim =  embedding_size) for _ in range(depth)]
-        )
+        self.time_text_embed = CombinedTimestepTextProjEmbeddings(embed_dim = embedding_size)
+        self.pos_embed = PatchEmbed(embedding_dim = embedding_size, patch_size = patch_size)
+
+        self.norm_out = AdaLayerNormContinuous(embed_dim = embedding_size)
+        self.context_embedder = nn.Linear(embedding_size, caption_projection_dim)
 
         self.embed_size = embedding_size
-        self.p_size = patch_size
+        self.patch_size = patch_size
+        self.output_channels = output_channels
 
-        self.film = FiLM(embedding_size)
+        self.transformer_blocks = nn.ModuleList([
 
-        self.time_mlp = nn.Sequential(
-            RotaryPositionalEncoding(embedding_size, max_seq_len = max_length),
-            nn.Linear(embedding_size, embedding_size * 2),
-            nn.GELU(),
-            nn.Linear(embedding_size * 2, embedding_size),
-            nn.GELU()
-        )
+            DiTBlock(
+                num_heads = heads,
+                embedding_size = embedding_size,
+                add_context_final = i == (depth - 1)
+            )
 
-        self.linear_patches = nn.Linear(patch_size * patch_size * 4, embedding_size)
+            for i in range(depth)
+            ])
 
-    def handle_patches(self, latent: torch.Tensor):
-
-        """ Creates and returns patches and time embeddings """
-
-        patches = patchify(latent, size = self.p_size)
-
-        # make matmul be patch size by patch size (ij,jk -> ik)
-        B, N, C, H, W = patches.shape
-        patches = self.linear_patches(patches.view(B, N, C * H * W)) # flatten dimensions
-
-        # create time based embeddings
-        time_embeddings = self.time_mlp(patches)
-
-        return patches, time_embeddings
+        self.proj_out = nn.Linear(embedding_size, patch_size * patch_size * output_channels)
     
-    def forward(self, latent: torch.Tensor, t: torch.Tensor, input_ids: torch.Tensor, attention_mask: torch.Tensor) -> torch.Tensor:
+    def forward(self, latent: torch.Tensor, encoder_hidden_states: torch.Tensor, timestep: torch.LongTensor,
+                pooled_projections: torch.Tensor) -> torch.Tensor:
 
-        " Goal: Given Space, Time, and Conditioned Prompt, Return Velocity Vector "
-
-        # t = current_time [0, 1]
-
-        patches, time_embeddings = self.handle_patches(latent)
-
-        # remove additional dim
-        if input_ids.dim() == 4: input_ids = input_ids.squeeze(1)
-
-        # concatenate patches and tokens
-        # resize for torch.cat
-        patches = patches.view(patches.size(0), -1, self.embed_size)
-        x = torch.cat([input_ids, patches], dim = 1)
-
-        # create zeros so time embeddings won't interfere with text (tokens) embeddings
-        zeros_text = torch.zeros(latent.size(0), input_ids.size(1), time_embeddings.size(-1), device = time_embeddings.device)
-        time_embeddings = torch.cat([zeros_text, time_embeddings], dim = 1)
-
-        # adjust attention mask to handle image patches
-        # (batch_size, num_patches + seq_len)
-        full_attention_mask = torch.cat([attention_mask, torch.ones(input_ids.size(0), patches.size(1), device = attention_mask.device)], dim = 1)
-
-        src_key_padding_mask = ~full_attention_mask.bool()
-
-        # make sure t has the correct shape
-        # (batch_size, seq_len + num_patches, 1)
-        t = t.squeeze(-1).expand(-1, x.size(1), -1) # broadcast
-
-        x = (self.film(x, cond = time_embeddings) + t).squeeze(0)
-
-        # pass attention mask for every layer
-        for layer in self.model:
-            x = layer(x, src_key_padding_mask = src_key_padding_mask)
-
-        # remove text processing from image
-        x = x[:, attention_mask.size(1):, :].reshape(x.size(0), -1 , 4, self.p_size, self.p_size)
-
-        output = depatchify(x)
-
-        return output
-    
-    def solve(self, latent: torch.Tensor, t: torch.Tensor):
-
-        """ Solve ODE in reversing the flow of the velocity vector
-            Returns the denoised latent
+        """ Goal: Given Space, Time, and Conditioned Prompt, Return Velocity Vector 
+            Input: Noised Latent, Specific Timestep, Pooled Text Projections, Encoded Text Embeddings
+            Output: Velocity vector
         """
 
-        x, time_embeddings = self.handle_patches(latent)
+        height, width = latent.shape[-2:]
+        hidden_states = self.pos_embed(latent)
 
-        t = t.view(-1, 1, 1)
-        t = t.expand(x.size(0), x.size(1), -1) 
+        encoder_hidden_states = self.context_embedder(encoder_hidden_states)
+        time_embeddings = self.time_text_embed(timestep, pooled_projections)
 
-        x = (self.film(x, cond = time_embeddings) + t).squeeze(0)
+        # pass attention mask for every layer
+        for layer in self.transformer_blocks:
 
-        for layer in self.model:
-            x = layer(x)
+            hidden_states = layer(
+                hidden_states = hidden_states,
+                encoder_hidden_states = encoder_hidden_states,
+                time_embeddings = time_embeddings,
+                use_chunking = True
+            )
 
-        x = x.reshape(x.size(0), -1 , 4, self.p_size, self.p_size)
+        hidden_states = self.norm_out(hidden_states, time_embeddings)
+        hidden_states = self.proj_out(hidden_states)
 
-        output = depatchify(x)
+        ##########################################################################################################
+        # Depatchify
 
+        height //= self.patch_size
+        width //= self.patch_size
+
+        hidden_states.reshape(
+            shape = (hidden_states.size(0), height, width, self.patch_size, self.patch_size, self.output_channels)
+        )
+
+        # permute tensor using einsum
+        # original = (batch, height, width, patch_size, patch_size, channels)
+        hidden_states = torch.einsum("nhwpqc->nchpwq", hidden_states)
+
+        output = hidden_states.reshape(
+            shape=(hidden_states.size(0), self.output_channels, height * self.patch_size, width * self.patch_size)
+        )
+        
         return output
 
 def test_dit():
-
+    # TODO: fix the DiT testing
     dit = DiT()
     latent = torch.randn(1, 4, 28, 28)
 

@@ -182,7 +182,7 @@ class T5EncoderModel(nn.Module):
 
         self.shared.weight = self.encoder.embed_tokens.weight # just in case
 
-    def forward(self, x, attn_mask: torch.Tensor, return_hidden: bool = False):
+    def forward(self, x, attn_mask: torch.Tensor):
 
         src_key_mask = attn_mask == 0
 
@@ -192,10 +192,6 @@ class T5EncoderModel(nn.Module):
             x = block(x, key_pad_mask = src_key_mask)
 
         x = self.encoder.final_layer_norm(x)
-
-        # for testing
-        if return_hidden:
-            return x
 
         x = self.shared(x)
 
@@ -228,8 +224,8 @@ def test_t5():
 
     import torch.nn.functional as F
 
-    outputs = F.normalize(model(tokens.unsqueeze(0), attn.unsqueeze(0), return_hidden = True).mean(dim = 1))
-    outputs2 = F.normalize(model(tokens2.unsqueeze(0), attn2.unsqueeze(0), return_hidden = True).mean(dim = 1))
+    outputs = F.normalize(model(tokens.unsqueeze(0), attn.unsqueeze(0)).mean(dim = 1))
+    outputs2 = F.normalize(model(tokens2.unsqueeze(0), attn2.unsqueeze(0)).mean(dim = 1))
     
     sim = F.cosine_similarity(outputs, outputs2)
 

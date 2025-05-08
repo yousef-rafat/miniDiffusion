@@ -3,8 +3,7 @@ import torch.nn as nn
 from collections import deque
 from dit_components import RMSNorm
 class PagedJointAttention(nn.Module):
-    def __init__(self, heads: int, embedding_size: int, dropout: float = 0.1, page_size: int = 512, max_pages: int = 16, 
-                batch_size: int = 1):
+    def __init__(self, heads: int, embedding_size: int, dropout: float = 0.1, page_size: int = 512, max_pages: int = 16):
         """
         Creates a Paged KV Cache Attention Mechanisim
         """
@@ -48,13 +47,10 @@ class PagedJointAttention(nn.Module):
         self.v_cache = deque(maxlen = self.max_pages)
 
     # key and value equal None to compliy with PyTorch's api
-    def forward(self, x: torch.Tensor, key = None, value = None, attn_mask = None, use_cache: bool = True, key_padding_mask: torch.Tensor = None, 
-                encoder_hidden_state: torch.Tensor = None, **kwargs):
+    def forward(self, x: torch.Tensor, attn_mask = None, use_cache: bool = True, key_padding_mask: torch.Tensor = None, 
+                encoder_hidden_state: torch.Tensor = None): 
         # reference attention equation
         # https://pbs.twimg.com/profile_images/1624054272676532224/UNv4ONME_400x400.jpg
-
-        if key is None: key = x
-        if value is None: value = x
 
         residual = x
 
@@ -86,9 +82,8 @@ class PagedJointAttention(nn.Module):
             K, V = new_K, new_V 
 
         # normalize query and key
-        print(Q.size())
-        Q = self.norm_q(Q)
-        K = self.norm_k(K)
+        Q = self.norm_q(Q.reshape(batch_size, seq_length, -1))
+        K = self.norm_k(K.reshape(batch_size, seq_length, -1))
 
         # the Joint Attention part
         if encoder_hidden_state is not None:
@@ -146,6 +141,7 @@ class PagedJointAttention(nn.Module):
             encoder_hidden_states = self.to_add_out(encoder_hidden_states)
 
         # linear + dropout
+        hidden_states = out
         for layer in self.to_out:
             hidden_states = layer(hidden_states)
 
@@ -184,18 +180,14 @@ class PagedJointAttention(nn.Module):
         super()
         self.reset_cache()
 
-class PagedTransformerEncoderLayer(nn.TransformerEncoderLayer):
-    " Transformer Encoder Layer with Paged Attention "
-    def __init__(self, embed_dim, num_heads, dim_feedforward: int = 2048, dropout = 0.1):
-        # dim_feedforward = number of hidden features in FFN
-        super().__init__(embed_dim, num_heads, dim_feedforward, dropout)
-        self.self_attn = PagedJointAttention(heads = num_heads, embedding_size = embed_dim, dropout = dropout)
 
 def test_atten(embed_dim = 512):
-    x = torch.rand(1024, embed_dim)
-    key_padding_mask = torch.zeros(1, 1024) 
-    model = PagedTransformerEncoderLayer(embed_dim = embed_dim, num_heads = 8)
-    output = model(x.unsqueeze(0), src_key_padding_mask = key_padding_mask)
+    
+    x = torch.rand(77, embed_dim)
+
+    attention = PagedJointAttention(embed_dim = embed_dim, num_heads = 8)
+    output = attention(x.unsqueeze(0))
+
     print(output)
     del model
 
