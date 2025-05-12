@@ -198,3 +198,6 @@ def test_dit():
     output = dit(latent = latent, input_ids = input_ids, attention_mask = attention_mask, t = t)
 
     print(output)
+
+if __name__ == "__main__":
+    test_dit()

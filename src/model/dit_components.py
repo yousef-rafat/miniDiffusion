@@ -2,7 +2,8 @@ import math
 import torch
 import torch.nn as nn
 from torch import Tensor
-from clip import CLIP
+import torch.nn.functional as F
+from clip import CLIP, OpenCLIP
 from t5_encoder import T5EncoderModel
 from tokenizer import TorchTokenizer, UnigramTokenizer
 
@@ -13,15 +14,27 @@ class HandlePrompt(nn.Module):
         self.clip_tokenizer = TorchTokenizer()
         self.t5_tokenizer = UnigramTokenizer()
     
-    def forward(self, x: torch.Tensor, clip: CLIP, t5_encoder: T5EncoderModel):
+    def forward(self, x: torch.Tensor, clip: CLIP, clip_2: OpenCLIP, t5_encoder: T5EncoderModel):
 
         clip_tokens = self.clip_tokenizer.tokenize(x)
         t5_tokens = self.t5_tokenizer.encode(x)
 
-        clip_embeds = clip.encode_text(clip_tokens)
+        clip_embeds, pooled = clip.encode_text(clip_tokens)
+        clip_2_embeds, pooled2 = clip_2.encode_text(clip_tokens)
+
         t5_embeds = t5_encoder(t5_tokens)
 
-        return clip_embeds, t5_embeds
+        clip_embeddings = torch.cat([clip_embeds, clip_2_embeds], dim = -1)
+
+        # get the difference between t5 and clip embeddings and pad it for it to become a matrix
+        clip_embeddings = F.pad(
+            clip_embeddings, 0, t5_embeds.size(-1) - clip_embeddings.size(-1)
+        )
+
+        embeddings = torch.cat([clip_embeds, t5_embeds], dim = -2)
+        pooled_embeddings = torch.cat([pooled, pooled2], dim = -1)
+
+        return embeddings, pooled_embeddings
     
 class TimeStepEmbeddings(nn.Module):
     def __init__(self, in_features: int = 256, out_features: int = 2432):
