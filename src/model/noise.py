@@ -1,158 +1,155 @@
 import torch
-from typing import Optional
 
+# Euler Scheduler For Training and Inference
+#////////////////////////////////////////////////////////////
 class NoiseScheduler(torch.nn.Module):
-    # Add Noise to an image gradually
-    def __init__(self, beta: int, timesteps: int, mu: float = 0.0, sigma: float = 1.0):
+    def __init__(self, num_training_timesteps: int = 1_000, base_shift: float = 0.5, shift: float = 3, 
+                 num_inference_timesteps: int = 50, inference: bool = False):
         super(NoiseScheduler, self).__init__()
 
-        self.beta = beta
-        # shift normal dist left or right
-        self.mu = mu
+        # shift normal dist left or right (mean)
+        self.base_shift = base_shift
         # control shape of logit-normal distrubition (standard deviation)
-        self.sigma = sigma
+        # shift < 1 = decay the noise earlier
+        self.shift = shift
 
-        self.timesteps = timesteps
-        # compute alpha values so we can index into them later
-        self.alphas = 1 - self.beta * torch.linspace(0, 1, timesteps)
-        # alpha bar represents our mean
-        # refrence equation: https://miro.medium.com/v2/resize:fit:242/format:webp/1*nIl1f0BYyqXM3TIDHHUaWg.png
-        self.alpha_bar = torch.cumprod(self.alphas, dim = 0) #cumulative product
+        # compute timestep values so we can index into them later
+        timesteps = torch.linspace(1.0, num_training_timesteps, int(num_training_timesteps))
 
-        # For Inference
-        #////////////////////////////////////////////////////////////
+        # normalize between 0 and 1
+        sigmas = timesteps / num_training_timesteps
 
-        # discrete timesteps for inference
-        self.sigmas = torch.sqrt((1 - self.alpha_bar) / self.alpha_bar)
+        # staticaly shift (fixed image size assumed)
+        self.sigmas = sigmas * shift / (1 + (shift - 1) * sigmas)
 
-    def sigma_scheduler(self, num_inference_steps):
+        # get timesteps after shifting
+        self.timesteps = self.sigmas * num_training_timesteps
 
-        # check if the first element is inifinity, and if so skip it
-        # culprit: torch.log(0) = inf
-        if torch.isinf(self.sigmas[0]) and self.sigmas[0] > 0:
-            sigmas = self.sigmas[:1]
-        else: sigmas = self.sigmas
+        self.num_training_timesteps = num_training_timesteps
+        self.num_inference_timesteps = num_inference_timesteps
 
-        log_s = torch.log(sigmas)
-        idxs = torch.linspace(0, sigmas.size(0) - 1, num_inference_steps, device = log_s.device).long()
-        
-        # add a zero at the end to reach the data distribution
-        sigmas = torch.cat([sigmas[idxs], torch.zeros(1, device = idxs.device)])
+        self.sigma_min = self.sigmas[-1].item()
+        self.sigma_max = self.sigmas[0].item()
 
-        return sigmas
+        if inference:
 
-    def check_timestep(self, timestep: int):
+            max_timestep = self.sigma_to_timestep(self.sigma_max)
+            min_timestep = self.sigma_to_timestep(self.sigma_min)
+
+            # go from full noise to clean image (descending)
+            timesteps = torch.linspace(max_timestep, min_timestep, num_inference_timesteps)
+
+            # same as for training
+            sigmas = timesteps / num_training_timesteps
+            sigmas = sigmas * shift / (1 + (shift - 1) * sigmas)
+            timesteps = sigmas * num_training_timesteps
+
+            # add a zero at the end to reach the data distribution
+            self.sigmas = torch.cat([sigmas, torch.zeros(1, device = sigmas.device)])
+
+        self.step_index = 0
+
+    def sigma_to_timestep(self, sigma):
+        return sigma * self.num_training_timesteps
+
+    def check_timestep(self, timestep):
         # check if timestep is valid
-        if timestep > self.timesteps:
+
+        if isinstance(timestep, torch.Tensor):
+            timestep = float(timestep.item())
+            
+        if timestep > self.num_training_timesteps:
             raise ValueError("Can't have a timestep larger than the defined timestep")
+
+    
+    def get_sigmas(self, timesteps, n_dim: int = 4):
+        " From the timestep, get the corresponding sigma (noise scale) "
+
+        # use binary search (torch.searchsorted) for finding indices
+        step_indices = [torch.searchsorted(self.timesteps, t).item() for t in timesteps]
+
+        sigma = self.sigmas[step_indices].flatten()
         
-    def sample_logit_timestep(self, batch_size: int = 1, device: str = "cpu"):
+        # expand to n_dim dims
+        sigma = sigma.view(tuple([sigma.size(0)] + [1] * (n_dim - 1)))
+
+        return sigma
+    
+    def index_of_timestep(self, timestep):
+        indice = (self.timesteps == timestep).nonzero()
+        return indice[0].item()
+        
+    def sample_logit_timestep(self, batch_size: int = 1, device: str = "cpu") -> float:
         " Sample timesteps from logit normal distribution "
         # returns timesteps in range [0, timesteps - 1]
         # beneficial to train the model on different noise levels
 
         uniform_samples = torch.rand(batch_size, device = device)
         # turn a uniform sample into a normal sample
-        normal_samples = torch.logit(uniform_samples, eps = 1e-8) * self.sigma + self.mu
+        normal_samples = torch.logit(uniform_samples, eps = 1e-8) * self.shift + self.base_shift
 
         sampled_t = torch.sigmoid(normal_samples)
 
-        weighted_sampled_t = (sampled_t * (self.timesteps - 1)).long() # scale
+        weighted_sampled_t = (sampled_t * (self.num_training_timesteps - 1)).long() # scale
         
-        return weighted_sampled_t
+        return weighted_sampled_t.item()
         
 
-    def add_noise(self, image: torch.Tensor,  timestep: int = None):
+    def add_noise(self, image: torch.FloatTensor,  timestep: float = None):
 
         """
+        Forward Process of Diffusion
         Adds noise to the image according to the timestep.
         t = Timestep at which to evaluate the noise schedule.
-                           If None, uses the final timestep.
         """
 
-        if timestep == None:
+        if timestep is None:
             timestep = self.sample_logit_timestep(image.size(0), device = image.device)
 
-        self.check_timestep(timestep)
+        self.check_timestep(timestep) 
 
         # randn_like will create the guassian noise
         # that will fit the image's dimensions
-        noise = torch.randn_like(image.float())
-        noised_image = torch.sqrt(self.alpha_bar[timestep]) * image + noise * torch.sqrt(1 - self.alpha_bar[timestep])
+        noise = torch.randn_like(image)
+
+        timestep = self.timesteps[timestep]
+        sigma = self.get_sigmas([timestep])
+
+        # noise the images
+        noised_image = (1.0 - sigma) * image + noise * sigma
 
         # returning noise is helpful for training
         return noised_image, noise
     
     @torch.no_grad()
-    def euler_solver(self, model, x: torch.Tensor, dt: Optional[float], steps: int = 5, stochasticity: bool = True):
-        " Implements Euler's ODE solver "
+    def reverse_flow(self, current_sample: torch.Tensor, model_output: torch.FloatTensor, timestep: float, stochasticity: bool):
 
-        if not dt: dt = 1 / steps
-        self.model = model
+        """ Function to integerate the reverse process (eval mode) for a latent by solving ODE by Euler's method """
 
-        for i in range(steps):
-            current_time = 1 - i * dt  # Current time decreasing from 1 to 0
-            xt = self.reverse_flow(x, dt, current_time, stochasticity = stochasticity)
+        # when timestep is zero, the data has been reached
+        if timestep <= 0:
+            return current_sample
         
-        return xt.cpu()
-    
-    @torch.no_grad()
-    def rk4_solver(self, model, x: torch.Tensor, dt: Optional[float] = None, steps: int = 4, stochasticity: bool = True):
-        " 4th-order Runge-Kutta ODE solver "
+        # upcast to avoid precision errors
+        current_sample = current_sample.to(torch.float32)
 
-        if not dt: dt = 1 / steps
-        self.model = model
+        # get the current and next sigma and the change between them
+        current_sigma = self.sigmas[self.step_index]
+        next_sigma = self.sigmas[self.step_index + 1]
+        dt = next_sigma - current_sigma
 
-        for i in range(steps):
-            # current time decreases from 1 to 0
-            current_time = 1 - i  * dt
-
-            # compute the RK4 increments
-            # k1 = f(x, t)
-            k1 = self.reverse_flow(x, dt, current_time, stochasticity = stochasticity)
-            # k2 = f(x + dt/2 * k1, t - dt/2)
-            k2 = self.reverse_flow(x + (dt / 2) * k1, current_time - dt / 2, current_time = current_time, stochasticity = stochasticity)
-            # k3 = f(x + dt/2 * k2, t - dt/2)
-            k3 = self.reverse_flow(x + (dt / 2) * k2, current_time - dt / 2, current_time = current_time, stochasticity = stochasticity)
-            # k4 = f(x + dt * k3, t - dt)
-            k4 = self.reverse_flow(x + dt * k3, current_time - dt, current_time = current_time, stochasticity = stochasticity)
-
-        dx = (dt / 6) * (k1 + 2 * k2 + 2 * k3 + k4)
-
-        x = x + dx
-
-        return x
-    
-    def reverse_flow(self, x: torch.Tensor, dt: float, current_time: float, stochasticity: bool):
-
-        """ Function to integerate the reverse process (eval mode) for a latent """
-
-        # dt: timestep for integeration (a small positive number)
-        # current_time: the time value in [0, 1], where 1 is pure noise and 0 is data
-
-        # when current time is zero, the data has been reached
-        if current_time <= 0:
-            return x
-
-        current_time = torch.tensor([current_time], dtype = x.dtype, device = x.device)
-        
-        # velocity field v(x, t)
-        with torch.no_grad():
-            x_prev = self.model.solve(x, current_time)
-        
         # stochasticity helps in randomizing what the model generates (increases diversity)
         if stochasticity:
-            noise = torch.randn_like(x)
-            # adjust dimensions to match the elementwise addition
-            x_prev = x_prev[:, :, :noise.size(-1), :noise.size(-1)]
-            # scale the noise by sqrt(dt) so variance is proportional to dt.
-            x_prev = x_prev + (torch.sqrt(torch.tensor(dt, device=x.device)) * noise)
+            noise = torch.randn_like(current_sample)
+            x_prev = current_sample - current_sigma * model_output
+            prev_sample = (1 - next_sigma) * x_prev  + noise * next_sigma
 
-        return x_prev
-    
-    @property
-    def get_alpha(self):
-        return self.alpha_bar
+        else:
+            prev_sample = current_sample + dt * model_output
+
+        self.step_index += 1
+
+        return prev_sample
     
 def test_noise():
 
@@ -162,16 +159,15 @@ def test_noise():
 
     image_dir = os.path.join(os.getcwd(), "assets", "cat.png")
     image = Image.open(image_dir)
-
     image = ToTensor()(image)
     
-    noiser = NoiseScheduler(0.9, 10)
+    noiser = NoiseScheduler()
     noised_image, _ = noiser.add_noise(image = image.unsqueeze(0))
     
     import matplotlib.pyplot as plt
-
+    print(noised_image.size())
     plt.figure()
-    plt.imshow(noised_image.squeeze(0).permute(1, 2, 0).numpy())
+    plt.imshow(noised_image.view(3, noised_image.size(-1), noised_image.size(-1)).permute(1, 2, 0).numpy())
     plt.axis("off")
     plt.show()
 

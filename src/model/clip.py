@@ -6,38 +6,60 @@ import torch.nn as nn
 import torch.nn.functional as F
 from tokenizer import TorchTokenizer
 
+def create_causal_mask(input_shape, device: str = "cpu"):
+    
+    B, seq_len, _ = input_shape.size()
+    mask = torch.full((seq_len, seq_len),
+                      torch.finfo(input_shape.dtype).min, # smallest representable number (-max)
+                      device = device)
+
+    # zero out the lower triangle
+    # the same as torch.triu(mask, diagonal = 1)
+    mask_cond = torch.arange(seq_len, device = device)
+    mask.masked_fill_(mask_cond < (mask_cond + 1).view(seq_len, 1), 0)
+
+    # for every batch to share the mask
+    # add two new dims          expand to
+    return mask[None, None, :, :].expand(B, 1, seq_len, seq_len)
+
 class QuickGELU(nn.Module):
     def forward(self, x: torch.Tensor):
         return x * torch.sigmoid(1.702 * x)
+    
 class TextEncoder(nn.Module):
-    def __init__(self, embed_dim: int = 768, depth: int = 12, num_heads: int = 12):
+    def __init__(self, embed_dim: int = 768, depth: int = 12, num_heads: int = 12, max_seq_len: int = 77):
         super(TextEncoder, self).__init__()
 
         vocab_size = 49408
 
         self.embeddings = nn.Module()
         self.embeddings.token_embedding = nn.Embedding(vocab_size, embed_dim)
-        # tokenizer's context_length must be set to 77 tokens
-        self.embeddings.position_embedding = nn.Embedding(77, embed_dim) # 77 = context length
+        # tokenizer's context_length must be set to 77 tokens for CLIP to work
+        self.embeddings.position_embedding = nn.Embedding(max_seq_len, embed_dim) # 77 = context length
 
         self.encoder = Encoder(embed_size = embed_dim, depth = depth, num_heads = num_heads)
 
         self.final_layer_norm = nn.LayerNorm(embed_dim)
 
+        # add in the register buffer so we won't have to recompute it every forward pass
+        self.register_buffer(
+            "positions", torch.arange(max_seq_len)[None, :], persistent = False
+        )
+
     def forward(self, text: torch.Tensor, attention_mask: torch.Tensor, return_hidden: bool = False):
 
         x = self.embeddings.token_embedding(text.long())
 
-        #                       seq_length
-        positions = torch.arange(x.size(1))
-        pos_embed = self.embeddings.position_embedding(positions)
+        pos_embed = self.embeddings.position_embedding(self.positions)
 
-        x += pos_embed.to(x.dtype).to(x.device)
+        causal_mask = create_causal_mask(x, device = x.device)
+        x = x + pos_embed.to(x.dtype).to(x.device)
 
         # obtain text embeddings
-        x = x.permute(1, 0, 2)
-        x, pentlum = self.encoder(x, attention_mask, return_pentlum = True)
-        x = x.permute(1, 0, 2)
+        x, pentlum = self.encoder(x, 
+                                  attention_mask,
+                                  causal_mask = causal_mask,
+                                  return_pentlum = True)
         
         # for debugging
         if return_hidden:
@@ -53,53 +75,72 @@ class TextEncoder(nn.Module):
 
         return pooled, pentlum
     
-class AttentionPool2d(nn.Module):
-    # modified class from: https://github.com/openai/CLIP/blob/main/clip/model.py#L58
-    def __init__(self, embed_dim: int, num_heads: int, output_dim: int = None):
+class CLIPAttention(nn.Module):
+    def __init__(self, embed_dim: int, num_heads: int, output_dim: int = None, dropout: float = 0.0):
         super().__init__()
+
+        assert embed_dim % num_heads == 0, "embed_dim must be dividable by num_heads"
 
         self.k_proj = nn.Linear(embed_dim, embed_dim)
         self.q_proj = nn.Linear(embed_dim, embed_dim)
         self.v_proj = nn.Linear(embed_dim, embed_dim)
 
         self.num_heads = num_heads
+        self.dropout_rate = dropout
+
+        self.head_dim = embed_dim // num_heads
+        self.scale = self.head_dim ** -0.5 # reciporical of sqrt
         
-        if output_dim is None: self.out_proj = nn.Linear(embed_dim, embed_dim)
-        else: self.out_proj = nn.Linear(embed_dim, output_dim)
+        self.out_proj = nn.Linear(embed_dim, output_dim if output_dim is not None else embed_dim)
 
-    def forward(self, x, src_pad_key = None, use_self_attention: bool = True):
+    def expand_attention_mask(self, attention_mask: torch.Tensor, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
 
-        # ensure (seq_len, B, embed_dim)
-        if x.shape[0] == 1:
-            x = x.permute(1, 0, 2)
+        """ [B, seq_len] -> [B, 1, seq_len, seq_len]
+            Important for addition between casual and pad masks
+        """
 
-        if use_self_attention: 
-            query = x
-        else: query = x[:1] # pooled attention
+        B, seq_len = attention_mask.size()
+        
+        mask =  attention_mask[:, None, None, :].expand(B, 1, seq_len, seq_len).to(dtype)
 
-        x, _ = F.multi_head_attention_forward(
-            query = query, key = x, value = x,
-            embed_dim_to_check = x.shape[-1],
-            num_heads=self.num_heads,
-            q_proj_weight=self.q_proj.weight,
-            k_proj_weight=self.k_proj.weight,
-            v_proj_weight=self.v_proj.weight,
-            in_proj_weight=None,
-            in_proj_bias=torch.cat([self.q_proj.bias, self.k_proj.bias, self.v_proj.bias]),
-            bias_k=None,
-            bias_v=None,
-            add_zero_attn=False,
-            dropout_p=0,
-            out_proj_weight=self.out_proj.weight,
-            out_proj_bias=self.out_proj.bias,
-            use_separate_proj_weight=True,
-            training = False,
-            need_weights = False,
-            key_padding_mask = src_pad_key
-        )
+        # invert because additive mask requires the opposite
+        mask = 1.0 - mask
 
-        # (B, C)
-        return x.squeeze(0)
+        return mask.masked_fill(mask.to(torch.bool), torch.finfo(dtype).min)
+
+
+    def forward(self, x, attention_mask, causal_attention_mask):
+
+        B, seq_len, embed_dim = x.size()
+
+        query = self.q_proj(x)
+        key = self.k_proj(x)
+        value = self.v_proj(x)
+
+        query = query.view(B, seq_len, -1, self.head_dim).transpose(1, 2)
+        key = key.view(B, seq_len, -1, self.head_dim).transpose(1, 2)
+        value = value.view(B, seq_len, -1, self.head_dim).transpose(1, 2)
+
+        # combine the masks
+        if attention_mask.dim() == 1:
+            attention_mask = attention_mask.unsqueeze(0)
+
+        attention_mask = self.expand_attention_mask(attention_mask)
+        attention_mask = attention_mask + causal_attention_mask
+
+        attn_weights = torch.matmul(query, key.transpose(-1, -2)) * self.scale
+        attn_weights = attn_weights + attention_mask
+
+        attn_outputs = F.softmax(attn_weights, dim = -1, dtype = torch.float32).to(query.dtype)
+        attn_outputs = F.dropout(attn_outputs, p = self.dropout_rate)
+
+        attn_output = torch.matmul(attn_outputs, value).transpose(1, 2).contiguous()
+        attn_output = attn_output.reshape(B, seq_len, embed_dim).contiguous()
+
+        output = self.out_proj(attn_output)
+
+        return output
+    
 class MLP(nn.Module):
     def __init__(self, embed_size, ratio = 4):
         super().__init__()
@@ -124,23 +165,22 @@ class EncoderLayer(nn.Module):
         self.layer_norm2 = nn.LayerNorm(embed_size)
         self.mlp = MLP(embed_size = embed_size, ratio = ratio)
 
-        self.self_attn = AttentionPool2d(num_heads = num_heads, embed_dim = embed_size)
+        self.self_attn = CLIPAttention(num_heads = num_heads, embed_dim = embed_size)
 
-    def forward(self, x: torch.Tensor, src_pad_key = None):
+    def forward(self, x: torch.Tensor, src_pad_key = None, causal_mask = None):
         
         residual = x
         x = self.layer_norm1(x)
-        
-        if src_pad_key is not None: 
-            x = self.self_attn(x, src_pad_key = src_pad_key, use_self_attention = True)
+        x = self.self_attn(x, attention_mask = src_pad_key, causal_attention_mask = causal_mask)
 
         # normalize and apply residual connections
-        x += residual
+        x = x + residual
 
         residual = x
         x = self.layer_norm2(x)
+        
         x = self.mlp(x)
-        x += residual
+        x = x + residual
 
         return x
 
@@ -150,32 +190,30 @@ class Encoder(nn.Module):
 
         self.layers = nn.ModuleList([EncoderLayer(embed_size = embed_size, num_heads = num_heads) for _ in range(depth)])
 
-    def forward(self, x: torch.Tensor, attention_mask = None, return_pentlum: bool = False):
+    def forward(self, x: torch.Tensor, attention_mask = None, causal_mask = None, return_pentlum: bool = False):
 
         if attention_mask is not None:
             src_key_mask = attention_mask == 0
-            if src_key_mask.dim() == 1: src_key_mask = src_key_mask.unsqueeze(0)
+            if src_key_mask.dim() == 1: src_key_mask = src_key_mask
 
             total_layers = len(self.layers)
 
             for i, layer in enumerate(self.layers):
-                x = layer(x, src_key_mask)
+                x = layer(x, src_key_mask, causal_mask = causal_mask)
                 if i == (total_layers - 2) and return_pentlum:
                     pentlum = x
-        
-        else:
-            for layer in self.layers:
-                x = layer(x)
 
         if return_pentlum: return x, pentlum
         else: return x
+
 class CLIP(nn.Module):
     def __init__(self, embed_dim: int = 768, depth: int = 12, num_heads: int = 12):
         super(CLIP, self).__init__()
 
-        self.text_model = TextEncoder(embed_dim = embed_dim, depth = depth, num_heads = num_heads)
         self.tokenizer = TorchTokenizer()
-        
+        self.text_model = TextEncoder(embed_dim = embed_dim, depth = depth, num_heads = num_heads,
+                                      max_seq_len = self.tokenizer.max_length)
+                
         self.text_projection = nn.Linear(embed_dim, embed_dim, bias = False)
         self.text_model.eval()
 
@@ -198,9 +236,9 @@ class CLIP(nn.Module):
 
         pooled_emb = self.text_projection(pooled_emb)
 
-        pooled_features = F.normalize(pooled_emb, dim=-1)
+        pooled_emb = F.normalize(pooled_emb, dim=-1)
 
-        return pooled_features, pentlum
+        return pooled_emb, pentlum
 
 class OpenCLIP(CLIP):
     def __init__(self):
@@ -213,18 +251,18 @@ def load_clip(model: CLIP, model_2: OpenCLIP, device = "cpu"):
     # checkpoints could be installed automatically from encoders/get_checkpoints.py
 
     clip_path = os.path.join(os.getcwd(), "encoders", "hub", "checkpoints", "clip_model.pth")
-    #model.load_state_dict(torch.load(clip_path, map_location = device), strict = True)
+    model.load_state_dict(torch.load(clip_path, map_location = device), strict = True)
 
     path = "d:\\encoders\\clip_2_saved\\saved.pth"
     path2 = "d:\\encoders\\clip_2\\models--laion--CLIP-ViT-bigG-14-laion2B-39B-b160k\\snapshots\\743c27bd53dfe508a0ade0f50698f99b39d03bec\\pytorch_model-00002-of-00002.bin"
 
-    missing, unexpected = model_2.load_state_dict(torch.load(path, map_location = device), strict = False)
-    missing2, unexpected2 = model_2.load_state_dict(torch.load(path2, map_location = device), strict = False)
+    #missing, unexpected = model_2.load_state_dict(torch.load(path, map_location = device), strict = False)
+    #missing2, unexpected2 = model_2.load_state_dict(torch.load(path2, map_location = device), strict = False)
     
     # for debuggging
     if DEBUG:
-        print(f"Missing keys ({len(missing2)}):", missing2)
-        print(f"\nUnexpected keys ({len(unexpected2)}):", unexpected2)
+        print(f"Missing keys ({len(missing)}):", missing)
+        print(f"\nUnexpected keys ({len(unexpected)}):", unexpected)
 
     model.eval()
     model_2.eval()
@@ -238,11 +276,10 @@ def test_clip():
 
     model, model_2 = load_clip(model, model_2)
 
-    ids, _ = model_2.encode_text("a photo of a cat")
-    ids2, _ = model_2.encode_text("a photo of a dog")
-    
-    from torch.nn.functional import cosine_similarity
+    ids, _ = model.encode_text("a photo of a cat")
+    ids2, _ = model.encode_text("a photo of a dog")
 
+    from torch.nn.functional import cosine_similarity
     print("cosine cat/dog:", cosine_similarity(ids, ids2, dim=-1).item())
 
 if __name__ == "__main__":

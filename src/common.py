@@ -1,25 +1,41 @@
+import math
 import torch
-import torch.nn as nn
 from torch.nn.functional import cosine_similarity
 
 ##################################
 # https://arxiv.org/pdf/2403.03206
 ##################################
 
-def loss_fn(v_pred: torch.Tensor, v_true: torch.Tensor, alpha_t):
-    # computes MSE for velocity vectors with scaled alpha t over beta t
+def logit_normal_weighting(t: torch.Tensor, mean: float = 0.0, std: float = 1.0) -> torch.Tensor:
 
-    sqrt_alpha_t = torch.sqrt(alpha_t)
-    beta_t = torch.sqrt(1 - alpha_t)
+    """ Logit-Normal Weighting
+        w(t) = 1/pi_ln(t; mean, std)
+        from Eq. (19) in the SD3 paper.
+    """
 
-    # small value to avoid division by zero
-    weight = (sqrt_alpha_t / (beta_t + 1e-8))
+    # avoid 0/1 edges
+    eps = 1e-6
+    t = t.clamp(eps, 1 - eps)
 
-    v_pred = v_pred[:, :, :v_true.size(-1), :v_true.size(-1)]
+    # weight w(t) equals the reciprocal of the pdf function (to remove bias)
+    term1 = (t * (1 - t)) * (std * math.sqrt(2 * math.pi))
+
+    logit_t = (t / (1 - t)).log()
+    term2 = torch.exp((logit_t - mean) ** 2 / (2 * (std ** 2)))
+
+    output = term1 * term2
     
-    loss = (weight * (v_pred - v_true) ** 2).mean()
+    return output
 
-    return loss
+def loss_fn(v_pred: torch.Tensor, v_true: torch.Tensor, sigma):
+    # computes MSE for velocity vectors with logit normal weighting
+
+    weight = logit_normal_weighting(sigma)
+    
+    loss = (weight * (v_pred - v_true) ** 2)\
+        .reshape(v_pred.size(0), -1).mean(dim = 1)
+
+    return loss.mean()
 
 def interpolate_samples(source, target, t):
     # linearly interpolate latents between noise and data

@@ -22,7 +22,7 @@ def inference(prompt: str, num_inference_steps: int = 50, device: str = "cpu"):
     checkpoint_path = os.path.join(os.getcwd(), "model", "checkpoint")
     model.load_state_dict(checkpoint_path)
 
-    latent = torch.randn(1, 4, 28, 28, device = model.device)  # initial latent space
+    latent = torch.randn(1, 4, 32, 32, device = model.device)  # initial latent space
 
     # inference loop
     with torch.no_grad():
