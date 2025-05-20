@@ -5,21 +5,21 @@
   "added_tokens": [
     {
       "id": 49406,
-      "special": true,
       "content": "<|startoftext|>",
       "single_word": false,
       "lstrip": false,
       "rstrip": false,
-      "normalized": true
+      "normalized": true,
+      "special": true
     },
     {
       "id": 49407,
-      "special": true,
       "content": "<|endoftext|>",
       "single_word": false,
       "lstrip": false,
       "rstrip": false,
-      "normalized": false
+      "normalized": false,
+      "special": true
     }
   ],
   "normalizer": {
@@ -46,7 +46,7 @@
       {
         "type": "Split",
         "pattern": {
-          "Regex": "<\\|startoftext\\|>|<\\|endoftext\\|>|'s|'t|'re|'ve|'m|'ll|'d|[\\p{L}]+|[\\p{N}]|[^\\s\\p{L}\\p{N}]+"
+          "Regex": "'s|'t|'re|'ve|'m|'ll|'d|[\\p{L}]+|[\\p{N}]|[^\\s\\p{L}\\p{N}]+"
         },
         "behavior": "Removed",
         "invert": true

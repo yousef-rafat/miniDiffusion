@@ -1,9 +1,46 @@
 import os
 import json
 import torch
-from itertools import takewhile
+import regex as re
+from torch.nn.utils.rnn import pad_sequence # for dynamic padding
 
-class TorchTokenizer:
+def to_utf_bytes():
+    # ord returns the unicode of a char
+    bytes = (
+          list(range(ord("!"), ord("~") + 1))   # ASCII Characters 33-126
+        + list(range(ord("¡"), ord("¬") + 1))   # Latin‑1 supplement: 161–172
+        + list(range(ord("®"), ord("ÿ") + 1))   # Latin‑1 supplement: 174–255
+    )
+
+    # copy the bytes
+    characters = bytes[:]
+    n = 0
+
+    # add unadded bytes by mapping them into high codepoints (256, 257, ...)
+    for byte in range(256): # 8-bits
+        if byte not in bytes:
+            bytes.append(byte)
+            characters.append(256 + n)
+            n += 1
+
+    # turn bytes to chars
+    characters = [chr(n) for n in characters]
+
+    return dict(zip(bytes, characters))
+
+def get_pairs(word):
+    " Turn words (e.g ['r', 'e', 'a', 'd'] into pairs like tuple('r', 'e'), tuple('e', 'a'), ... ) "
+
+    prev_word = word[0]
+    pairs = set()
+
+    for word in word[1:]:
+        pairs.add((prev_word, word))
+        prev_word = word
+
+    return pairs
+    
+class TorchTokenizer: # Byte-Level Byte-Pair Tokenizer
     def __init__(self, tokenizer_path: str = "tokenizer.json", max_length: int = 77):
 
         # Load the tokenizer.json file
@@ -13,10 +50,16 @@ class TorchTokenizer:
             tokenizer_data = json.load(f)
         
         self.max_length = max_length
-        # Extract vocabulary
+
+        # extract vocabulary and merges
         self.vocab = tokenizer_data["model"]["vocab"]
-        # For detokenization
-        self.inv_vocab = {v: k for k, v in self.vocab.items()}
+        merges = tokenizer_data["model"]["merges"]
+
+        # split merges on white space "re ad" -> tuple("re", "ad")
+        bpe_merges = [tuple(merge.split()) for merge in merges]
+        self.bpe_ranks = dict(zip(bpe_merges, range(len(bpe_merges))))
+
+        self.byte_encoder = to_utf_bytes()
 
         self.vocab_len = len(self.vocab)
 
@@ -25,44 +68,136 @@ class TorchTokenizer:
 
         self.pad_id = self.unk_token = self.end
 
-        self.special_vocab = ["<|startoftext|>", "<|endoftext|>"]
+        # will later expand with added tokens from tokenization
+        self.cache = { "<|startoftext|>": "<|startoftext|>",  "<|endoftext|>": "<|endoftext|>"}
+
+        self.pattern = re.compile(
+            #           special tokens                 contractions      get letters and digits  other non-whitespace
+            r"""<\|startoftext\|>|<\|endoftext\|>|'s|'t|'re|'ve|'m|'ll|'d|[\p{L}]+|[\p{N}]|[^\s\p{L}\p{N}]+""",
+            re.IGNORECASE # ignore Capital Cases A = a in this pattern search
+        )
+
+    def bpe_tokenize(self, token):
+
+        """ Applies the merging logic """
+        
+        # if token was previously tokenize, just return it from the cache
+        if token in self.cache:
+            return self.cache[token]
+
+        # all the words in a tuple + last letter with end of word token
+        word = tuple(token[:-1]) + tuple(token[-1] + "</w>")
+        pairs = get_pairs(word)
+
+        # if not pairs (single word)
+        if pairs:
+            return token + "</w>"
+        
+        # iterate over highest-priority pairs and tokenize them
+        # until all the merges happen (text gets tokenized)
+        while True:
+            # map pairs to the most occuring merges according to their rank (higher rank -> merge earlier)
+            bigram = min(pairs, key = lambda pair: self.bpe_ranks.get(pair, float("inf")))
+
+            # if the end has been reached (full text tokenization)
+            if bigram not in self.bpe_ranks:
+                break
+            
+            # unpack the two symbols you're about to merge
+            first, second = bigram
+
+            new_word = []
+            i = 0
+
+            # find the symbols and reconstruct the word
+            while i < len(word):
+
+                # get the index of the first word
+                try:
+                    j = word.index(first, i)
+                # if there no more 'first' letter occuring, then it will throw a ValueError
+                except ValueError:
+                    # index was found (letter) in the word,
+                    # so escape because there's nothing to merge
+                    new_word.extend(word[i:])
+                    break
+                else: 
+                    # if succeeded, copy the letters from i to j (where the first letter index appeared)
+                    new_word.extend(word[i:j])
+                    i = j
+                
+                if word[i] == first and word[i + 1] == second and i < len(word):
+                    # if pair was found, append it and increment by 2
+                    new_word.append(first + second)
+                    i += 2
+                    # continue until ValueError is raised
+
+                else:
+                    # if no pair was found, continue searching
+                    new_word.append(word[i])
+                    i += 1
+
+            new_word = tuple(new_word)
+            word = new_word
+
+            # if the vocab has a full subword, exit (word collabsed into a single symbol)
+            # otherwise it will continue or exist if if bigram not in self.bpe_ranks
+            if len(word) == 1:
+                break
+            else:
+                pairs = get_pairs(word)
+
+        word = " ".join(word)
+        self.cache[word] = word
+
+        return word
 
     def tokenize(self, text):
-        """Tokenizes text by splitting on whitespace and maps to vocab."""
-        # split by white space
-        tokens = text.lower().split()
-        token_ids = [self.vocab.get(token, self.unk_token) for token in tokens]
-        attention_mask = torch.ones(self.max_length)
+        """Tokenizes text by splitting on whitespace and maps to vocab."""  
+
+        # normalize
+        text = text.lower()
+
+        token_ids = []
+        # use re to split text on whitespace and only get useful data
+        for token in re.findall(self.pattern, text):
+            # turn data to utf-8 bytes
+            token = "".join(
+                self.byte_encoder[t] for t in token.encode("utf-8")
+            )
+
+            bpe_tokens = self.bpe_tokenize(token).split(" ")
+
+            for sub in bpe_tokens:
+                token_ids.append(self.vocab.get(sub, self.unk_token))
+
+        # add start and end tokens
+        token_ids = [self.start] + token_ids + [self.end]
 
         # truncate
         if len(token_ids) < self.max_length:
             token_ids = token_ids[:self.max_length]
 
-        # add starting token
-        token_ids.insert(0, self.start)
-
-        # add ending token 
-        token_ids.append(self.end)
-
-        # pad the rest
-        while len(token_ids) < self.max_length:
-            token_ids.append(self.pad_id)
-            attention_mask[len(token_ids) - 1] = 0
-
-        return torch.tensor(token_ids, dtype = torch.long), attention_mask.long()
-
-    def detokenize(self, token_ids, skip_special_tokens = True):
-        """Converts token IDs back to text."""
-        
-        #                                                          skip pad tokens
-        tokens = [self.inv_vocab.get(id, self.unk_token) for id in takewhile(lambda x: x != self.pad_id, token_ids)]
-
-        if skip_special_tokens:
-            tokens = [token for token in tokens if token not in self.special_vocab]
-
-        return " ".join(tokens)
+        return torch.tensor(token_ids, dtype = torch.long)
     
-class UnigramTokenizer:
+    def tokenize_batch(self, texts):
+
+        " Dynamic padding "
+
+        input_ids = [torch.tensor(self.tokenize(text), dtype = torch.long) for text in texts]
+
+        padded_ids = pad_sequence(input_ids, batch_first = True, padding_value = self.pad_id)
+
+        attention_mask = (padded_ids != self.pad_id).long()
+
+        # get the eos token and turn it to one in the attention mask
+        # this is beacause eos and pad token share the same id, so it gets padded out
+        eos_id = attention_mask.argmax(dim = 1)
+        attention_mask[eos_id] = 1
+
+        return padded_ids, attention_mask
+    
+class UnigramTokenizer: # For T5 Encoder
     def __init__(self, max_length: int = 77):
 
         # get from encoders/get_checkpoints.py
@@ -137,35 +272,26 @@ class UnigramTokenizer:
 
         # map to IDs
         ids = [self.token_to_id.get(p, self.token_to_id[self.unk_token]) for p in pieces]
-        attn = torch.ones(self.max_length, dtype = torch.long) # initalize attn mask
 
         # truncate
         if len(ids) >= self.max_length:
             ids = ids[:self.max_length] 
         else:
-            attn[len(ids):] = 0 # build attn mask
             ids += [self.token_to_id[self.unk_token]] * (self.max_length - len(ids)) # pad
 
-        return torch.tensor(ids, dtype=torch.long), attn
-
-    def decode(self, token_ids):
-        # convert IDs back to pieces
-        pieces = [self.id_to_token.get(int(i), self.unk_token) for i in token_ids]
-        #join, restore spaces
-        return ''.join(pieces).replace('▁', ' ').strip()
-    
+        return torch.tensor(ids, dtype=torch.long)
     
 def test_tokenizer():
+    
+    text = "Hello World"
+
     tokenizer = TorchTokenizer()
-    text = "hello world"
-    token_ids, _ = tokenizer.tokenize(text)
+    token_ids = tokenizer.tokenize(text)
 
     tokenizer = UnigramTokenizer()
-    token_ids, attn = tokenizer.encode(text)
+    token_ids = tokenizer.encode(text)
 
     print("Tokenized:", token_ids) 
-    print("Attention Mask: ", attn)
-    print("Detokenized:", tokenizer.decode(token_ids.tolist()))
 
 if __name__ == "__main__":
     test_tokenizer()

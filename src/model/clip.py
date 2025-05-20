@@ -49,11 +49,12 @@ class TextEncoder(nn.Module):
     def forward(self, text: torch.Tensor, attention_mask: torch.Tensor, return_hidden: bool = False):
 
         x = self.embeddings.token_embedding(text.long())
+        pos_ids = self.positions[:, :x.size(1)] # till seq_length
 
-        pos_embed = self.embeddings.position_embedding(self.positions)
+        pos_embed = self.embeddings.position_embedding(pos_ids)
 
-        causal_mask = create_causal_mask(x, device = x.device)
         x = x + pos_embed.to(x.dtype).to(x.device)
+        causal_mask = create_causal_mask(x, device = x.device)
 
         # obtain text embeddings
         x, pentlum = self.encoder(x, 
@@ -76,7 +77,7 @@ class TextEncoder(nn.Module):
         return pooled, pentlum
     
 class CLIPAttention(nn.Module):
-    def __init__(self, embed_dim: int, num_heads: int, output_dim: int = None, dropout: float = 0.0):
+    def __init__(self, embed_dim: int, num_heads: int, output_dim: int = None):
         super().__init__()
 
         assert embed_dim % num_heads == 0, "embed_dim must be dividable by num_heads"
@@ -86,28 +87,11 @@ class CLIPAttention(nn.Module):
         self.v_proj = nn.Linear(embed_dim, embed_dim)
 
         self.num_heads = num_heads
-        self.dropout_rate = dropout
 
         self.head_dim = embed_dim // num_heads
         self.scale = self.head_dim ** -0.5 # reciporical of sqrt
         
         self.out_proj = nn.Linear(embed_dim, output_dim if output_dim is not None else embed_dim)
-
-    def expand_attention_mask(self, attention_mask: torch.Tensor, dtype: torch.dtype = torch.bfloat16) -> torch.Tensor:
-
-        """ [B, seq_len] -> [B, 1, seq_len, seq_len]
-            Important for addition between casual and pad masks
-        """
-
-        B, seq_len = attention_mask.size()
-        
-        mask =  attention_mask[:, None, None, :].expand(B, 1, seq_len, seq_len).to(dtype)
-
-        # invert because additive mask requires the opposite
-        mask = 1.0 - mask
-
-        return mask.masked_fill(mask.to(torch.bool), torch.finfo(dtype).min)
-
 
     def forward(self, x, attention_mask, causal_attention_mask):
 
@@ -125,14 +109,12 @@ class CLIPAttention(nn.Module):
         if attention_mask.dim() == 1:
             attention_mask = attention_mask.unsqueeze(0)
 
-        attention_mask = self.expand_attention_mask(attention_mask)
         attention_mask = attention_mask + causal_attention_mask
 
         attn_weights = torch.matmul(query, key.transpose(-1, -2)) * self.scale
         attn_weights = attn_weights + attention_mask
 
         attn_outputs = F.softmax(attn_weights, dim = -1, dtype = torch.float32).to(query.dtype)
-        attn_outputs = F.dropout(attn_outputs, p = self.dropout_rate)
 
         attn_output = torch.matmul(attn_outputs, value).transpose(1, 2).contiguous()
         attn_output = attn_output.reshape(B, seq_len, embed_dim).contiguous()
@@ -190,21 +172,21 @@ class Encoder(nn.Module):
 
         self.layers = nn.ModuleList([EncoderLayer(embed_size = embed_size, num_heads = num_heads) for _ in range(depth)])
 
-    def forward(self, x: torch.Tensor, attention_mask = None, causal_mask = None, return_pentlum: bool = False):
+    def forward(self, hidden_states: torch.Tensor, attention_mask = None, causal_mask = None, return_pentlum: bool = False):
 
         if attention_mask is not None:
-            src_key_mask = attention_mask == 0
-            if src_key_mask.dim() == 1: src_key_mask = src_key_mask
 
+            src_key_mask = attention_mask == 0
             total_layers = len(self.layers)
 
             for i, layer in enumerate(self.layers):
-                x = layer(x, src_key_mask, causal_mask = causal_mask)
+                hidden_states = layer(hidden_states, src_key_mask, causal_mask = causal_mask)
+                # get the before the last hidden state for DiT
                 if i == (total_layers - 2) and return_pentlum:
-                    pentlum = x
+                    pentlum = hidden_states
 
-        if return_pentlum: return x, pentlum
-        else: return x
+        if return_pentlum: return hidden_states, pentlum
+        else: return hidden_states
 
 class CLIP(nn.Module):
     def __init__(self, embed_dim: int = 768, depth: int = 12, num_heads: int = 12):
@@ -225,8 +207,9 @@ class CLIP(nn.Module):
         
         # tokenize strings if raw text passed
         if attention_mask is None:
-            input_ids, attention_mask = self.tokenizer.tokenize(input_ids)
-        
+            input_ids, attention_mask = self.tokenizer.tokenize_batch([input_ids])
+        print(input_ids)
+        print(attention_mask)
         # ensure batch dim
         if input_ids.dim() == 1:
             input_ids = input_ids.unsqueeze(0)
