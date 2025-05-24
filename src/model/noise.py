@@ -119,7 +119,7 @@ class NoiseScheduler(torch.nn.Module):
         noised_image = (1.0 - sigma) * image + noise * sigma
 
         # returning noise is helpful for training
-        return noised_image, noise
+        return noised_image, noise, timestep
     
     @torch.no_grad()
     def reverse_flow(self, current_sample: torch.Tensor, model_output: torch.FloatTensor, timestep: float, stochasticity: bool):

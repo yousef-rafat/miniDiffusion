@@ -8,7 +8,6 @@ from model.vae import VAE
 import matplotlib.pyplot as plt
 from model.noise import NoiseScheduler 
 import torchvision.transforms.v2 as v2
-from model.tokenizer import TorchTokenizer
 from torchvision.transforms import ToTensor
 from torchvision.datasets import ImageFolder
 from torch.utils.data import IterableDataset, DataLoader 
@@ -45,9 +44,8 @@ class ImageDataset(IterableDataset):
         self.labels = image_dataset.classes
 
         self.transforms = transforms
-        self.scheduler = NoiseScheduler(beta = 0.9, timesteps = 10)
+        self.scheduler = NoiseScheduler()
         self.make_trainable = OptimizeImage()
-        self.tokenizer = TorchTokenizer()
         self.vae = VAE()
 
         self.batch_size = batch
@@ -71,26 +69,25 @@ class ImageDataset(IterableDataset):
                 image = Image.open(image_path)
 
                 label = self.labels[label_idx]
-                input_ids, attention_mask = self.tokenizer.tokenize(label)
 
                 if self.transforms:
                     image = self.transforms(image)
 
                 image = image.expand(3, -1, -1).unsqueeze(0) # turn to RGB
 
-                latent_dist = self.vae.encode(image) # turn to latent space
+                latent_dist = self.vae.encode(image).sample() # turn to latent space
                 latent = latent_dist.sample() 
 
-                noise, _ = self.scheduler.add_noise(latent.unsqueeze(0))
+                noise, added_noise, timestep = self.scheduler.add_noise(latent.unsqueeze(0))
 
                 noise = self.make_trainable(noise)
 
                 # do manual batching
                 batch.append((latent,
                              noise,
-                             image,
-                             input_ids.detach(),
-                             attention_mask.detach()))
+                             added_noise,
+                             timestep,
+                             label))
                 
                 sample_count += 1
                 

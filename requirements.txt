@@ -1,5 +1,6 @@
-# matplotlib for visualizing only (optional)
+# matplotlib for testing only (optional)
 torch
 torchvision
 matplotlib
 pillow
+sentencepiece

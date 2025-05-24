@@ -2,6 +2,7 @@ import os
 import json
 import torch
 import regex as re
+import sentencepiece as spm # required for T5FastTokenizer
 from torch.nn.utils.rnn import pad_sequence # for dynamic padding
 
 def to_utf_bytes():
@@ -197,39 +198,23 @@ class TorchTokenizer: # Byte-Level Byte-Pair Tokenizer
 
         return padded_ids, attention_mask
     
+SPIECE_UNDERLINE = "▁"
+
 class UnigramTokenizer: # For T5 Encoder
     def __init__(self, max_length: int = 77):
 
         # get from encoders/get_checkpoints.py
         tokenizer_json_path = os.path.join(os.getcwd(), "encoders", "hub", "checkpoints", "t5_tokenizer", "tokenizer.json")
 
-        with open(tokenizer_json_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
+        self.spm_model = spm.SentencePieceProcessor()
+        self.spm_model.Load(tokenizer_json_path)
 
-        vocab_list = data['model']['vocab']  # list of [piece, log-prob]
-
-        # lookup tables
-        self.token_scores = {piece: score for piece, score in vocab_list}
-        self.token_to_id  = {piece: idx   for idx, (piece, _) in enumerate(vocab_list)}
-
-        self.id_to_token  = {idx: piece for piece, idx in self.token_to_id.items()}
-        self.max_length   = max_length
-
-        # 3) Ensure an <unk> token exists
+        self.max_length = max_length
+        
+        # 3) Ensure an special token exists
         self.unk_token = '<unk>'
-        max_score = max(self.token_scores.values())
-
-        if self.unk_token not in self.token_scores:
-
-            unk_id = len(self.token_to_id)
-            self.token_to_id[self.unk_token]  = unk_id
-
-            self.token_scores[self.unk_token] = max_score
-            self.id_to_token[unk_id]         = self.unk_token
-
-        # 4) compute the longest piece ( '▁' counts as one char )
-        self.max_piece_len = max(len(piece) for piece in self.token_scores)
-
+        self.pad_token = '<pad>'
+        
     def encode(self, text: str):
         """ Searches for the best way of splitting text by maximizing their probabilities """
 
@@ -283,7 +268,7 @@ class UnigramTokenizer: # For T5 Encoder
     
 def test_tokenizer():
     
-    text = "Hello World"
+    text = "a photo of a dog"
 
     tokenizer = TorchTokenizer()
     token_ids = tokenizer.tokenize(text)

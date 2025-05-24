@@ -37,19 +37,6 @@ def loss_fn(v_pred: torch.Tensor, v_true: torch.Tensor, sigma):
 
     return loss.mean()
 
-def interpolate_samples(source, target, t):
-    # linearly interpolate latents between noise and data
-    return source * (1 - t) + target * t
-
-def get_ground_truth_velocity(image: torch.Tensor, noise: torch.Tensor, alpha_t):
-    # refer to reference papar above:
-
-    a_t = torch.sqrt(alpha_t)
-    b_t = torch.sqrt(1 - alpha_t)
-
-    v_t = (a_t * image + b_t * noise) / torch.sqrt(a_t**2 + b_t**2)
-    return v_t
-
 def compute_clip_loss(clip, generated_image, text_embs):
     " compute the similarity loss between text and generated image "
 

@@ -24,6 +24,24 @@ class DenseRelu(nn.Module):
     def forward(self, x):
         return self.wo(self.dropout(self.activation(self.wi_0(x)) * self.wi_1(x)))
 
+class T5LayerFF(nn.Module):
+    def __init__(self, embed_dim: int, ff_size: int, dropout_rate: float = 0.1):
+        super().__init__()
+
+        self.layer_norm = RMSNorm(embed_dim)
+        self.dropout = nn.Dropout(dropout_rate)
+        self.DenseReluDense = DenseRelu(embed_size = embed_dim, ff_size = ff_size, drop_rate = dropout_rate)
+
+    def forward(self, hidden_states):
+        
+        # forward pass
+        forwarded_states = self.layer_norm(hidden_states)
+        forwarded_states = self.DenseReluDense(forwarded_states)
+
+        # residual connection
+        hidden_states = hidden_states + self.dropout(forwarded_states)
+
+        return hidden_states
 class SelfAttention(nn.Module):
     def __init__(self, embed_size: int, num_heads: int, index: int, relative_attention_bias: int = 32, max_length: int = 128, dropout_rate: float = 0.1):
         super().__init__()
@@ -84,7 +102,7 @@ class SelfAttention(nn.Module):
 
         return relative_buckets + torch.where(is_small, relative_position, relative_if_large)
 
-    def compute_bias(self, seq_len, device):
+    def compute_bias_(self, seq_len, device):
         """Compute the (1, heads, seq_len, seq_len) bias tensor."""
 
         context_position = torch.arange(seq_len, device=device)[:, None]
@@ -95,26 +113,37 @@ class SelfAttention(nn.Module):
 
         values    = self.relative_attention_bias(rp_bucket)     # (seq, seq, heads)
         return values.permute(2, 0, 1).unsqueeze(0)             # (1, heads, seq, seq)
-
-    def forward(self, x, key_pad_mask = None):
+    
+    def forward(self, x, position_bias = None, key_pad_mask = None):
 
         B, seq_len, _ = x.size()
 
         # reshape for multi-head attention
-        query = self.q(x).view(B, seq_len, self.n_heads, self.head_dim).transpose(1,2)
-        key = self.k(x).view(B, seq_len, self.n_heads, self.head_dim).transpose(1,2)
-        value = self.v(x).view(B, seq_len, self.n_heads, self.head_dim).transpose(1,2)
+        query = self.q(x).view(B, -1, self.n_heads, self.head_dim).transpose(1,2)
+        key = self.k(x).view(B, -1, self.n_heads, self.head_dim).transpose(1,2)
+        value = self.v(x).view(B, -1, self.n_heads, self.head_dim).transpose(1,2)
 
-        scores = torch.matmul(query, key.transpose(-2, -1)) / math.sqrt(self.head_dim)
+        scores = torch.matmul(query, key.transpose(3, 2))
+        key_len = key.size(-2)
 
         # relative-pos
-        if self.first_index:
-            bias = self.compute_bias(seq_len, x.device)
-            scores += bias
+        if position_bias is None:
 
-        if key_pad_mask is not None:
-            key_pad_mask = key_pad_mask.unsqueeze(1).unsqueeze(2)
-            scores = scores.masked_fill(key_pad_mask, float("-inf"))
+            if self.first_index:
+                position_bias = self.compute_bias(seq_len, x.device)
+                # get from end till seq_len
+                position_bias = position_bias[:, :, -seq_len:, :]
+            else:
+                # initalize position_bias to zeros
+                position_bias = torch.zeros(
+                    1, self.n_heads, seq_len, key_len, dtype = scores.dtype, device = scores.device
+                )
+
+            if key_pad_mask is not None:
+                key_pad_mask = key_pad_mask[:, :, :, :key_len]
+                position_bias = position_bias + key_pad_mask
+
+        scores += position_bias
 
         attentions = F.softmax(scores, dim = -1)
 
@@ -124,76 +153,68 @@ class SelfAttention(nn.Module):
         out = out.transpose(1,2).contiguous().view(B, seq_len, self.embed_size)
         outputs = self.o(out)
 
-        return outputs
+        return outputs, position_bias
 
-class T5EncoderLayer(nn.Module):
-    def __init__(self, embed_dim, ff_dim, index, num_heads: int = 12, attention: bool = False, dropout_rate: float = 0.1):
+class T5LayerSelfAttention(nn.Module):
+    def __init__(self, embed_dim: int, num_heads: int, index: int):
         super().__init__()
 
-        self.attention = attention
+        self.SelfAttention = SelfAttention(embed_size = embed_dim, num_heads = num_heads, index = index)
+        self.layer_norm = RMSNorm(hidden_size = embed_dim)
 
-        if attention:
-            self.SelfAttention = SelfAttention(embed_size = embed_dim, num_heads = num_heads, index = index)
-        else:
-            # called Relu because of the checkpoint :)
-            self.DenseReluDense = DenseRelu(embed_size = embed_dim, ff_size = ff_dim)
-
-        self.layer_norm = RMSNorm(embed_dim)
-        self.dropout = nn.Dropout(dropout_rate)
-
-    def forward(self, x, key_pad_mask = None):
-
-        x = self.layer_norm(x)
+    def forward(self, hidden_states, pad_mask, position_bias = None):
         
-        if self.attention:
-            x = self.SelfAttention(x, key_pad_mask = key_pad_mask)
+        norm_hidden_states = self.layer_norm(hidden_states)
+        attn_outputs, position_bias = self.SelfAttention(norm_hidden_states, key_pad_mask = pad_mask, position_bias = position_bias)
 
-        else: x = self.DenseReluDense(x)
+        # residual connection
+        hidden_states = hidden_states + attn_outputs
 
-        x = self.dropout(x)
-
-        return x
-
+        return hidden_states, position_bias
+    
 class T5Encoder(nn.Module):
-    def __init__(self, embed_dim, ff_dim, index):
+    def __init__(self, embed_dim, num_heads, ff_dim, index):
         super().__init__()
-        self.layer = nn.ModuleList([T5EncoderLayer(embed_dim, ff_dim, index = index, attention = True), T5EncoderLayer(embed_dim, ff_dim, index = 1)])
+        self.layer = nn.ModuleList([T5LayerSelfAttention(embed_dim, num_heads, index = index), T5LayerFF(embed_dim, ff_dim)])
 
-    def forward(self, x, key_pad_mask = None):
+    def forward(self, x, key_pad_mask = None, position_bias = None):
 
-        attn_outputs = self.layer[0](x, key_pad_mask = key_pad_mask)
-        x = self.layer[1](x)
-
-        x += attn_outputs
+        hidden_states, position_bias = self.layer[0](x,
+                                                     pad_mask = key_pad_mask,
+                                                     position_bias = position_bias)
+        x = self.layer[1](hidden_states)
         
-        return x
+        return x, position_bias
 
 class T5EncoderModel(nn.Module):
-    def __init__(self, embed_dim: int = 768, ff_dim: int = 2048):
+    def __init__(self, embed_dim: int = 768, num_heads: int = 12, ff_dim: int = 2048):
         super().__init__()
         vocab_size = 32128
 
         self.encoder = nn.Module()
-        self.encoder.block = nn.ModuleList([T5Encoder(embed_dim, ff_dim, index = i) for i in range(12)])
+        self.encoder.block = nn.ModuleList([T5Encoder(embed_dim, ff_dim = ff_dim, num_heads = num_heads, index = i) for i in range(12)])
         self.encoder.final_layer_norm = RMSNorm(embed_dim)
 
         self.encoder.embed_tokens = nn.Embedding(vocab_size, embed_dim)
-        self.shared = nn.Linear(embed_dim, vocab_size, bias = False)
+        self.shared = nn.Embedding(vocab_size, embed_dim)
 
-        self.shared.weight = self.encoder.embed_tokens.weight # just in case
+    def forward(self, text, attn_mask: torch.Tensor):
 
-    def forward(self, x, attn_mask: torch.Tensor):
+        x = self.encoder.embed_tokens(text) 
 
-        src_key_mask = attn_mask == 0
+        src_key_mask = attn_mask == 0 # invert attn_mask
 
-        x = self.encoder.embed_tokens(x) 
+        # expand the attention mask
+        mask = src_key_mask[:, None, None, :].to(x.dtype)
+        mask = mask * torch.finfo(x.dtype).min # min = -max
         
+        # we create the position_bias and store them in the first layer,
+        # then we share the position_bias with all of the rest of layers
+        position_bias = None
         for block in self.encoder.block:
-            x = block(x, key_pad_mask = src_key_mask)
+            x, position_bias = block(x, key_pad_mask = mask, position_bias = position_bias)
 
         x = self.encoder.final_layer_norm(x)
-
-        x = self.shared(x)
 
         return x
 
@@ -213,11 +234,19 @@ def load_t5(model: T5EncoderModel, device: str = "cpu") -> T5EncoderModel:
     return model
 
 def test_t5():
+
     from tokenizer import UnigramTokenizer
 
     tokenizer = UnigramTokenizer()
-    tokens, attn = tokenizer.encode("hello world")
-    tokens2, attn2 = tokenizer.encode("hello worlds")
+
+    #tokens = tokenizer.encode("a photo of a cat")
+    #tokens2 = tokenizer.encode("a photo of a house")
+    # 629
+    tokens = torch.tensor([3, 9, 1202, 13, 3, 9, 1782, 1])
+    tokens2 = torch.tensor([3, 9, 1202, 13, 3, 9, 1712, 1]) # cat
+
+    attn = torch.ones_like(tokens)
+    attn2 = torch.ones_like(tokens2)
 
     model = T5EncoderModel()
     model = load_t5(model)

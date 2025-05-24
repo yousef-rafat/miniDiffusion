@@ -4,7 +4,6 @@ import torch.nn as nn
 from torch import Tensor
 import torch.nn.functional as F
 from clip import CLIP, OpenCLIP
-from t5_encoder import T5EncoderModel
 from tokenizer import TorchTokenizer, UnigramTokenizer
 
 class HandlePrompt(nn.Module):
@@ -14,7 +13,7 @@ class HandlePrompt(nn.Module):
         self.clip_tokenizer = TorchTokenizer()
         self.t5_tokenizer = UnigramTokenizer()
     
-    def forward(self, x: torch.Tensor, clip: CLIP, clip_2: OpenCLIP, t5_encoder: T5EncoderModel):
+    def forward(self, x: torch.Tensor, clip: CLIP, clip_2: OpenCLIP, t5_encoder):
 
         clip_tokens = self.clip_tokenizer.tokenize(x)
         t5_tokens = self.t5_tokenizer.encode(x)

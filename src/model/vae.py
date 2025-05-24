@@ -229,6 +229,7 @@ class Encoder(nn.Module):
 
         # intial layer
         self.conv_in = nn.Conv2d(in_channels, base_channels, kernel_size = 3, padding = 1)
+        self.conv_act = nn.SiLU()
 
         self.down_blocks = nn.ModuleList()
         channels = base_channels
@@ -268,6 +269,7 @@ class Encoder(nn.Module):
             h = layer(h)
 
         h = self.conv_norm_out(h)
+        h = self.conv_act(h)
         h = self.conv_out(h)
 
         return h
@@ -329,7 +331,7 @@ class Decoder(nn.Module):
         h = self.conv_norm_out(h)
         h = self.conv_out(h)
 
-        return torch.sigmoid(h)
+        return torch.tanh(h)
     
 class VAE(nn.Module):
     # Create the variational autoencoder
@@ -403,7 +405,7 @@ def load_vae(model: VAE, device: str = "cpu") -> VAE:
 
 def test_vae():
 
-    from torchvision.transforms import ToTensor
+    from torchvision.transforms import ToTensor, Lambda
     import matplotlib.pyplot as plt
     from PIL import Image
     import torch
@@ -417,6 +419,7 @@ def test_vae():
 
     image = Resize(size=(256, 256))(image)
     image = ToTensor()(image).unsqueeze(0)
+    image = Lambda(lambda t: t * 2 - 1)(image)
 
     with torch.no_grad():
         latent_dist = vae.encode(image)
@@ -430,12 +433,12 @@ def test_vae():
     print(recon.size())
 
     _, axes = plt.subplots(1, 2, figsize=(10, 5))
-    axes[0].imshow(image.squeeze(0).permute(1, 2, 0).numpy())
+    axes[0].imshow(image.squeeze(0).permute(1, 2, 0).numpy() / 2 + 0.5)
 
     axes[0].set_title("Original")
     axes[0].axis("off")
 
-    axes[1].imshow(recon.squeeze(0).permute(1, 2, 0).numpy())
+    axes[1].imshow(recon.squeeze(0).permute(1, 2, 0).numpy() / 2 + 0.5)
     axes[1].set_title("Reconstructed")
 
     axes[1].axis("off")
