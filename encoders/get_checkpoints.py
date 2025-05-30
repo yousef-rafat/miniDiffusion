@@ -3,6 +3,7 @@
 
 from transformers import CLIPTextModelWithProjection, T5EncoderModel, T5TokenizerFast
 from huggingface_hub import hf_hub_download
+from diffusers import SD3Transformer2DModel
 from safetensors.torch import load_file
 import torch
 import os
@@ -27,6 +28,9 @@ t5_cache = get_path("t5")
 vae_filename = "diffusion_pytorch_model.safetensors"
 clip_filename = "pytorch_model.bin"
 
+diff_repo = "stabilityai/stable-diffusion-3.5-medium"
+diff_filename = get_path("sd3")
+
 if not os.path.exists(vae_cache):
     vae_weights_path = hf_hub_download(repo_id=vae_repo, filename = vae_filename, cache_dir = vae_cache)
     print(f"VAE weights downloaded: {vae_weights_path}")
@@ -35,6 +39,15 @@ if not os.path.exists(vae_cache):
     torch.save(vae_state_dict, get_path("vae_checkpoint.pth"))
 
     print("Converted and Saved VAE .safetensors to .pth")
+
+if not os.path.exists(diff_filename):
+
+    model = SD3Transformer2DModel.from_pretrained(
+        diff_repo,  subfolder="transformer",
+        token = "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",
+        torch_dtype = torch.bfloat16
+    )
+    torch.save(model.to(torch.bfloat16).state_dict(), os.path.join("D:\\encoders", "sd3"))
 
 # --- CLIP Part using Transformers ---
 

@@ -16,7 +16,7 @@ effects = v2.Compose([
     v2.RandomRotation(degrees=(0, 60)),
     v2.RandomHorizontalFlip(),
     v2.RandomPerspective(distortion_scale = 0.4, p = 0.6),
-    v2.Resize(size = (256, 256)), # for vae
+    v2.Resize(size = (384, 384)), # for vae
     ToTensor()
 ])
 

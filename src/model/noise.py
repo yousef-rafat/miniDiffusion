@@ -162,7 +162,7 @@ def test_noise():
     image = ToTensor()(image)
     
     noiser = NoiseScheduler()
-    noised_image, _ = noiser.add_noise(image = image.unsqueeze(0))
+    noised_image, _, _ = noiser.add_noise(image = image.unsqueeze(0))
     
     import matplotlib.pyplot as plt
     print(noised_image.size())

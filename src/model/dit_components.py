@@ -36,7 +36,7 @@ class HandlePrompt(nn.Module):
         return embeddings, pooled_embeddings
     
 class TimeStepEmbeddings(nn.Module):
-    def __init__(self, in_features: int = 256, out_features: int = 2432):
+    def __init__(self, in_features: int = 256, out_features: int = 1536):
         super().__init__()
 
         self.linear_1 = nn.Linear(in_features, out_features)
@@ -50,8 +50,12 @@ class TimeStepEmbeddings(nn.Module):
         return self.linear_2(x)
     
 class PixArtAlphaTextProjection(TimeStepEmbeddings):
-    def __init__(self, in_features = 2048, out_features = 2432):
-        super().__init__(in_features, out_features)
+    def __init__(self, in_features = 1536, out_features = 2048):
+        super().__init__()
+        
+        self.linear_1 = nn.Linear(out_features, in_features)
+        self.act = nn.SiLU()
+        self.linear_2 = nn.Linear(in_features, in_features)
 
 class AdaLayerNormContinuous(nn.Module):
     """ Modulate Image Features With Text Features """
@@ -61,7 +65,7 @@ class AdaLayerNormContinuous(nn.Module):
         self.silu = nn.SiLU()
         # linearly project it so we can split into scale and shift later
         self.linear = nn.Linear(embed_dim, embed_dim * 2)
-        self.norm = nn.LayerNorm(embed_dim)
+        #self.norm = nn.LayerNorm(embed_dim)
 
     def forward(self, x, cond_embed):
 
@@ -77,8 +81,8 @@ class AdaLayerNormContinuous(nn.Module):
     
 class AdaLayerNormZero(AdaLayerNormContinuous):
     def __init__(self, in_features = 2432):
-        out_features = in_features * 6
-        super().__init__(in_features, out_features)
+        super().__init__(in_features)
+        self.linear = nn.Linear(in_features, in_features * 6)
 
     def forward(self, x):
 
@@ -92,20 +96,51 @@ class AdaLayerNormZero(AdaLayerNormContinuous):
         # gate_mlp = gate for scaling before residual connection
         return x, gate_msa, shift_mlp, scale_mlp, gate_mlp
     
+class AdaLayerNormZeroX(AdaLayerNormContinuous):
+    def __init__(self, embed_dim = 1536):
+        super().__init__(embed_dim)
+        self.linear = nn.Linear(embed_dim, embed_dim * 9)
+
+    def forward(self, hidden_states: torch.Tensor, embed: torch.Tensor) -> torch.Tensor:
+
+        embed = self.linear(self.silu(embed))
+        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp, shift_msa2, scale_msa2, gate_msa2 = embed.chunk(
+            9, dim = 1
+        )
+        norm_hidden_states = self.norm(hidden_states)
+
+        # multiply by weights and add bias to the normalized hidden states
+        hidden_states = norm_hidden_states * (1 + scale_msa[:, None]) + shift_msa[:, None]
+        norm_hidden_states2 = norm_hidden_states * (1 + scale_msa2[:, None]) + shift_msa2[:, None]
+
+        return hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp, norm_hidden_states2, gate_msa2
+
+    
+class GELU(nn.Module):
+    " GELU with tanh approximation and a linear layer "
+    def __init__(self, dim: int, dim_out: int):
+        super().__init__()
+        self.proj = nn.Linear(dim, dim_out)
+
+    def gelu(self, x):
+        return F.gelu(x, approximate = "tanh")
+    
+    def forward(self, x):
+        x = self.proj(x)
+        x = self.gelu(x)
+
+        return x
+    
 class FeedForward(nn.Module):
-    def __init__(self, dim: int = 2432, dropout_rate: float = 0.0):
+    def __init__(self, dim: int = 1536, dropout_rate: float = 0.0):
         super().__init__()
 
         hidden_dim = dim * 4
         self.net = nn.ModuleList([
-            nn.Sequential(
-                nn.GELU(),
-                nn.Linear(dim, hidden_dim)
-            ),
+            GELU(dim, hidden_dim),
             nn.Dropout(dropout_rate),
-            nn.Linear(hidden_dim, dim)
+            nn.Linear(hidden_dim, dim),
         ])
-
 
     def forward(self, x):
         
@@ -115,9 +150,10 @@ class FeedForward(nn.Module):
         return x
     
 class PatchEmbed(nn.Module):
-    def __init__(self, in_channels: int = 16, embedding_dim: int = 2432, image_size: int = 256, patch_size: int = 16):
+    def __init__(self, in_channels: int = 16, embedding_dim: int = 2432, image_size: int = 384, patch_size: int = 16):
+        super().__init__()
 
-        self.proj = nn.Conv2d(in_channels, embedding_dim, kernel_size = 2, stride = 2, bias = False)
+        self.proj = nn.Conv2d(in_channels, embedding_dim, kernel_size = 2, stride = 2)
         self.pos_embed_max_size = image_size // patch_size
 
         self.height = self.width = image_size // patch_size
@@ -154,7 +190,7 @@ class PatchEmbed(nn.Module):
         top = (self.pos_embed_max_size - height) // 2
         left = (self.pos_embed_max_size - width) // 2
 
-        spatial_pos_embed = self.pos_emed.reshape(1, self.pos_embed_max_size, self.pos_embed_max_size, -1)
+        spatial_pos_embed = self.pos_embed.reshape(1, self.pos_embed_max_size, self.pos_embed_max_size, -1)
         spatial_pos_embed = spatial_pos_embed[:, top: top + height, left: left + width, :]
 
         return spatial_pos_embed.reshape(1, -1, spatial_pos_embed.shape[-1])
@@ -167,22 +203,30 @@ class PatchEmbed(nn.Module):
         grid_h = torch.arange(grid_size) / (grid_size / base_size)
         grid_w = torch.arange(grid_size) / (grid_size / base_size)
 
+        # create indexing (0,0), (0,1),... for each position of a patch
+        # returns the x coordinates and y coordinates for each no. of patches and stack them together
         grid = torch.meshgrid(grid_w, grid_h, indexing = "xy")
-        grid = torch.stack(grid, dim = 0).reshape(2, 1, grid_size, grid_size)
+        grid = torch.stack(grid, dim = 0)
 
+        # ensure correct shape
+        grid = grid.reshape(2, 1, grid_size, grid_size)
+
+        # actual function that gets the positional embeddings
         return PatchEmbed.get_2d_sincos_pod_embed_grid(embed_dim, grid)
 
     @staticmethod
-    def get_2d_sincos_pod_embed_grid(embed_dim, grid_size):
-        emb_h = PatchEmbed.get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid_size)
-        emb_w = PatchEmbed.get_1d_sincos_pos_embed_from_grid(embed_dim // 2, grid_size)
+    def get_2d_sincos_pod_embed_grid(embed_dim, grid):
+        # get 1d sincos embeddings and combine them into 2d
+        emb_h = PatchEmbed.get_1d_sincos_pos_embed_grid(embed_dim // 2, grid[0])
+        emb_w = PatchEmbed.get_1d_sincos_pos_embed_grid(embed_dim // 2, grid[1])
         return torch.cat([emb_h, emb_w], dim=1)
     
     @staticmethod
-    def get_1d_sincos_pos_embed_grid(embed_dim):
+    def get_1d_sincos_pos_embed_grid(embed_dim, pos):
 
+        # generate vector of frequencies
         omega = torch.arange(embed_dim // 2)
-        omega /= embed_dim / 2.0
+        omega = omega.float() / (embed_dim / 2.0)
         omega = 1.0 / 10000 ** omega
 
         pos = pos.reshape(-1)

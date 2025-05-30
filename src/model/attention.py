@@ -3,7 +3,8 @@ import torch.nn as nn
 from collections import deque
 from dit_components import RMSNorm
 class PagedJointAttention(nn.Module):
-    def __init__(self, heads: int, embedding_size: int, dropout: float = 0.1, page_size: int = 512, max_pages: int = 16):
+    def __init__(self, heads: int, embedding_size: int, dropout: float = 0.1, page_size: int = 512, max_pages: int = 16,
+                 add_q_context: bool = None, add_kv_proj: bool = False):
         """
         Creates a Paged KV Cache Attention Mechanisim
         """
@@ -11,15 +12,19 @@ class PagedJointAttention(nn.Module):
 
         self.heads = heads
         self.embedding_size = embedding_size
+        self.add_q_context = add_q_context
+        self.add_kv_proj = add_kv_proj
         self.page_size = page_size
         self.max_pages = max_pages
         self.max_tokens = max_pages * page_size
 
         # normalization
-        self.norm_q = RMSNorm(embedding_size)
-        self.norm_k = RMSNorm(embedding_size)
-        self.norm_added_q = RMSNorm(embedding_size)
-        self.norm_added_k = RMSNorm(embedding_size)
+        self.norm_q = RMSNorm(heads)
+        self.norm_k = RMSNorm(heads)
+
+        if add_kv_proj:
+            self.norm_added_q = RMSNorm(heads)
+            self.norm_added_k = RMSNorm(heads)
 
         self.to_out = nn.ModuleList([
             nn.Linear(embedding_size, embedding_size),
@@ -37,16 +42,21 @@ class PagedJointAttention(nn.Module):
         self.to_v = nn.Linear(embedding_size, embedding_size)
 
         # for joint attention
-        self.add_q_proj = nn.Linear(embedding_size, embedding_size)
-        self.add_k_proj = nn.Linear(embedding_size, embedding_size)
-        self.add_v_proj = nn.Linear(embedding_size, embedding_size)
+        if add_kv_proj:
 
-        self.to_add_out = nn.Linear(embedding_size, embedding_size)
+            if add_q_context is not None:
+                self.add_q_proj = nn.Linear(embedding_size, embedding_size)
+
+            self.add_k_proj = nn.Linear(embedding_size, embedding_size)
+            self.add_v_proj = nn.Linear(embedding_size, embedding_size)
+
+        if add_q_context is not None and not add_q_context:
+            self.to_add_out = nn.Linear(embedding_size, embedding_size)
+        else: self.to_add_out = None
 
         self.k_cache = deque(maxlen = self.max_pages)
         self.v_cache = deque(maxlen = self.max_pages)
 
-    # key and value equal None to compliy with PyTorch's api
     def forward(self, x: torch.Tensor, attn_mask = None, use_cache: bool = True, key_padding_mask: torch.Tensor = None, 
                 encoder_hidden_state: torch.Tensor = None): 
         # reference attention equation

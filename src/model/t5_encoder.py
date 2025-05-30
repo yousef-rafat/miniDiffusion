@@ -9,7 +9,7 @@ from dit_components import RMSNorm
     
 class DenseRelu(nn.Module):
     """ T5 feed-forward with gating: wo(GELU(wi_0(x)) * wi_1(x)) """
-    def __init__(self, embed_size: int, ff_size: int, drop_rate: float = 0.1):
+    def __init__(self, embed_size: int, ff_size: int):
         super().__init__()
 
         # ff_size = fead-forward size (dimensions)
@@ -19,18 +19,15 @@ class DenseRelu(nn.Module):
         self.wo = nn.Linear(ff_size, embed_size, bias = False)
         self.activation = nn.GELU()
 
-        self.dropout = nn.Dropout(drop_rate)
-
     def forward(self, x):
-        return self.wo(self.dropout(self.activation(self.wi_0(x)) * self.wi_1(x)))
+        return self.wo(self.activation(self.wi_0(x)) * self.wi_1(x))
 
 class T5LayerFF(nn.Module):
-    def __init__(self, embed_dim: int, ff_size: int, dropout_rate: float = 0.1):
+    def __init__(self, embed_dim: int, ff_size: int):
         super().__init__()
 
         self.layer_norm = RMSNorm(embed_dim)
-        self.dropout = nn.Dropout(dropout_rate)
-        self.DenseReluDense = DenseRelu(embed_size = embed_dim, ff_size = ff_size, drop_rate = dropout_rate)
+        self.DenseReluDense = DenseRelu(embed_size = embed_dim, ff_size = ff_size)
 
     def forward(self, hidden_states):
         
@@ -39,11 +36,11 @@ class T5LayerFF(nn.Module):
         forwarded_states = self.DenseReluDense(forwarded_states)
 
         # residual connection
-        hidden_states = hidden_states + self.dropout(forwarded_states)
+        hidden_states = hidden_states + forwarded_states
 
         return hidden_states
 class SelfAttention(nn.Module):
-    def __init__(self, embed_size: int, num_heads: int, index: int, relative_attention_bias: int = 32, max_length: int = 128, dropout_rate: float = 0.1):
+    def __init__(self, embed_size: int, num_heads: int, index: int, relative_attention_bias: int = 32, max_length: int = 128):
         super().__init__()
 
         assert embed_size % num_heads == 0, "embedding size must be divisable by no. of heads"
@@ -66,8 +63,6 @@ class SelfAttention(nn.Module):
 
         self.max_length = max_length
         self.num_buckets = relative_attention_bias
-
-        self.attn_dropout = nn.Dropout(dropout_rate)
 
     def _relative_position_bucket(self, relative_position):
         """Copied from HuggingFace T5Attention._relative_position_bucket (slightly modified)"""
@@ -102,7 +97,7 @@ class SelfAttention(nn.Module):
 
         return relative_buckets + torch.where(is_small, relative_position, relative_if_large)
 
-    def compute_bias_(self, seq_len, device):
+    def compute_bias(self, seq_len, device):
         """Compute the (1, heads, seq_len, seq_len) bias tensor."""
 
         context_position = torch.arange(seq_len, device=device)[:, None]
@@ -146,8 +141,6 @@ class SelfAttention(nn.Module):
         scores += position_bias
 
         attentions = F.softmax(scores, dim = -1)
-
-        attentions = self.attn_dropout(attentions)
 
         out = torch.matmul(attentions, value)
         out = out.transpose(1,2).contiguous().view(B, seq_len, self.embed_size)
@@ -237,7 +230,7 @@ def test_t5():
 
     from tokenizer import UnigramTokenizer
 
-    tokenizer = UnigramTokenizer()
+    #tokenizer = UnigramTokenizer()
 
     #tokens = tokenizer.encode("a photo of a cat")
     #tokens2 = tokenizer.encode("a photo of a house")
@@ -253,8 +246,8 @@ def test_t5():
 
     import torch.nn.functional as F
 
-    outputs = F.normalize(model(tokens.unsqueeze(0), attn.unsqueeze(0)).mean(dim = 1))
-    outputs2 = F.normalize(model(tokens2.unsqueeze(0), attn2.unsqueeze(0)).mean(dim = 1))
+    outputs = model(tokens.unsqueeze(0), attn.unsqueeze(0)).mean(dim = 1)
+    outputs2 = model(tokens2.unsqueeze(0), attn2.unsqueeze(0)).mean(dim = 1)
     
     sim = F.cosine_similarity(outputs, outputs2)
 

@@ -1,9 +1,9 @@
 import torch
 import torch.nn as nn
-from model.attention import PagedJointAttention
-from model.dit_components import ( 
+from attention import PagedJointAttention
+from dit_components import ( 
     CombinedTimestepTextProjEmbeddings, PatchEmbed, AdaLayerNormContinuous, AdaLayerNormZero,
-    FeedForward, chunk_feed_forward
+    FeedForward, AdaLayerNormZeroX, chunk_feed_forward
 )
 
 ####################################################################################
@@ -11,29 +11,44 @@ from model.dit_components import (
 ####################################################################################
 
 class DiTBlock(nn.Module):
-    def __init__(self, num_heads: int, embedding_size: int = 1536, add_context_final: bool = False, dropout_rate: float = 0.0):
+    def __init__(self, num_heads: int, embedding_size: int = 1536, add_context_final: bool = False, dropout_rate: float = 0.0,
+                 use_dual_attention: int = None):
         super().__init__()
 
         """
         add_context_final: add special processings for the final layer in the model
         """
 
-        self.norm_1 = AdaLayerNormZero(in_features= embedding_size)
-
         self.final_context = add_context_final
+        self.use_dual_attention = use_dual_attention
+
+        if use_dual_attention:
+            self.norm1 = AdaLayerNormZeroX(embedding_size)
+        else:
+            self.norm1 = AdaLayerNormZero(embedding_size)
 
         if add_context_final:
             self.norm1_context = AdaLayerNormContinuous(embed_dim = embedding_size)
         else: self.norm1_context = AdaLayerNormZero(in_features = embedding_size)
 
-        self.attn = PagedJointAttention(embedding_size = embedding_size, num_heads = num_heads, dropout = dropout_rate)
-        self.ff = FeedForward(dropout_rate = dropout_rate)
+        self.attn = PagedJointAttention(embedding_size = embedding_size, 
+                                        heads = num_heads, 
+                                        dropout = dropout_rate, 
+                                        add_kv_proj = True,
+                                        add_q_context = add_context_final)
+
+        if use_dual_attention is not None:
+            self.attn2 = PagedJointAttention(embedding_size = embedding_size,
+                                             heads = num_heads,
+                                             dropout = dropout_rate)
+            
+        self.ff = FeedForward(dim = embedding_size, dropout_rate = dropout_rate)
 
         # for ff layer
-        self.norm2 = nn.LayerNorm(embedding_size)
+        #self.norm2 = nn.LayerNorm(embedding_size)
 
-        if add_context_final:
-            self.ff_context = FeedForward(dim = embedding_size)
+        if not add_context_final:
+            self.ff_context = FeedForward(dim = embedding_size, dropout_rate = dropout_rate)
             self.norm2_context = nn.LayerNorm(embedding_size, elementwise_affine = False)
         else:
             self.ff_context = None
@@ -107,8 +122,8 @@ class DiTBlock(nn.Module):
 # MultiModal Diffiusion Transformer Block (MMDiT)
 class DiT(nn.Module):
     # reference for rectified flow: https://arxiv.org/pdf/2403.03206
-    def __init__(self, heads: int = 8, embedding_size: int = 1536, patch_size: int = 16, depth: int = 5, caption_projection_dim: int = 1152,
-                 output_channels: int = 16):
+    def __init__(self, heads: int = 64, embedding_size: int = 1536, patch_size: int = 1, depth: int = 24,
+                 output_channels: int = 16, caption_projection_dim: int = 4096, dual_attention_layers: tuple = tuple(range(13))):
         super(DiT, self).__init__()
 
         #####################
@@ -118,8 +133,7 @@ class DiT(nn.Module):
         self.time_text_embed = CombinedTimestepTextProjEmbeddings(embed_dim = embedding_size)
         self.pos_embed = PatchEmbed(embedding_dim = embedding_size, patch_size = patch_size)
 
-        self.norm_out = AdaLayerNormContinuous(embed_dim = embedding_size)
-        self.context_embedder = nn.Linear(embedding_size, caption_projection_dim)
+        self.context_embedder = nn.Linear(caption_projection_dim, embedding_size)
 
         self.embed_size = embedding_size
         self.patch_size = patch_size
@@ -130,13 +144,15 @@ class DiT(nn.Module):
             DiTBlock(
                 num_heads = heads,
                 embedding_size = embedding_size,
-                add_context_final = i == (depth - 1)
+                add_context_final = i == (depth - 1),
+                use_dual_attention = True if i in dual_attention_layers else None
             )
 
             for i in range(depth)
             ])
 
-        self.proj_out = nn.Linear(embedding_size, patch_size * patch_size * output_channels)
+        self.norm_out = AdaLayerNormContinuous(embedding_size)
+        self.proj_out = nn.Linear(embedding_size, heads)
     
     def forward(self, latent: torch.Tensor, encoder_hidden_states: torch.Tensor, timestep: torch.LongTensor,
                 pooled_projections: torch.Tensor) -> torch.Tensor:
@@ -184,10 +200,26 @@ class DiT(nn.Module):
         )
         
         return output
+    
+def load_dit(dit: DiT) -> DiT:
+
+    DEBUG = True
+
+    path = "d:\\encoders\\sd3"
+    missing, unexpected = dit.load_state_dict(torch.load(path), strict = False)
+
+    if DEBUG:
+        print(f"Missing keys ({len(missing)}):", missing)
+        print(f"\nUnexpected keys ({len(unexpected)}):", unexpected)
+
+    dit.eval()
+
+    return dit
 
 def test_dit():
     # TODO: fix the DiT testing
     dit = DiT()
+    dit = load_dit(dit)
     latent = torch.randn(1, 4, 28, 28)
 
     input_ids = torch.randint(50000, size = (1, 1024))

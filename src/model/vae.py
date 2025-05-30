@@ -362,7 +362,7 @@ class VAE(nn.Module):
             output_channels = input_channels  
         )
 
-        self.resizer = Resize(size = (256, 256))
+        self.resizer = Resize(size = (384, 384))
 
     def encode(self, x):
 
@@ -417,7 +417,7 @@ def test_vae():
     image_path = os.path.join(os.getcwd(), "assets", "cat.webp")
     image = Image.open(image_path).convert("RGB")
 
-    image = Resize(size=(256, 256))(image)
+    image = Resize(size=(384, 384))(image)
     image = ToTensor()(image).unsqueeze(0)
     image = Lambda(lambda t: t * 2 - 1)(image)
 
