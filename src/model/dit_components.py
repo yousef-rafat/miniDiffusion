@@ -65,7 +65,7 @@ class AdaLayerNormContinuous(nn.Module):
         self.silu = nn.SiLU()
         # linearly project it so we can split into scale and shift later
         self.linear = nn.Linear(embed_dim, embed_dim * 2)
-        #self.norm = nn.LayerNorm(embed_dim)
+        self.norm = nn.LayerNorm(embed_dim, elementwise_affine = False)
 
     def forward(self, x, cond_embed):
 
@@ -84,9 +84,9 @@ class AdaLayerNormZero(AdaLayerNormContinuous):
         super().__init__(in_features)
         self.linear = nn.Linear(in_features, in_features * 6)
 
-    def forward(self, x):
+    def forward(self, x: Tensor, embed: Tensor):
 
-        emb = self.linear(self.silu(x))
+        emb = self.linear(self.silu(embed))
 
         shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = emb.chunk(6, dim=1)
         #                   multiplicative scale      bias
@@ -150,11 +150,12 @@ class FeedForward(nn.Module):
         return x
     
 class PatchEmbed(nn.Module):
-    def __init__(self, in_channels: int = 16, embedding_dim: int = 2432, image_size: int = 384, patch_size: int = 16):
+    def __init__(self, in_channels: int = 16, embedding_dim: int = 2432, image_size: int = 384, patch_size: int = 16,
+                 pos_embed_max_size: int = 96):
         super().__init__()
 
         self.proj = nn.Conv2d(in_channels, embedding_dim, kernel_size = 2, stride = 2)
-        self.pos_embed_max_size = image_size // patch_size
+        self.pos_embed_max_size = pos_embed_max_size
 
         self.height = self.width = image_size // patch_size
         self.base_size = self.height // patch_size
@@ -173,9 +174,11 @@ class PatchEmbed(nn.Module):
 
     def forward(self, x):
         
+        height, width = x.shape[-2:]
         x = self.proj(x)
-
-        pos_embed = self.cropped_pos_embed(self.size, self.size)
+        x = x.flatten(2).transpose(2, 1)
+    
+        pos_embed = self.cropped_pos_embed(height, width)
 
         return (x + pos_embed)
     
@@ -245,64 +248,57 @@ class RMSNorm(nn.Module):
     def forward(self, hidden_states):
 
         variance = hidden_states.pow(2).mean(-1, keepdim = True)    
-        hidden_states *= torch.rsqrt(variance + self.eps) # 1 / sqrt(variance)
+        hidden_states = hidden_states * torch.rsqrt(variance + self.eps) # 1 / sqrt(variance)
 
         return self.weight * hidden_states
     
-def get_timestep_embeddings(timesteps: Tensor, embed_dim: int, max_period: int = 10_000, downscale_freq_shift: float = 1,
-                            flip_sin_cos: bool = True) -> Tensor:
+def get_timestep_embeddings(timesteps: Tensor, embed_dim: int = 256, max_period: int = 10_000) -> Tensor:
     """ Get the sin-cos time embeddings """
     # time step embeddings for diffusion models are important as it gives
     # diffusion models a sense of time or progression and how much noise there is
 
-    assert timesteps.dim() == 1, "timesteps dimensions must be equal to one"
+    assert len(timesteps.shape) == 1, "timesteps dimensions must be equal to one"
 
     # split embeddings into two halves, one for sin and the other for cos
     half_dim = embed_dim // 2
 
-    exponent = -math.log(max_period) * torch.arange(0, half_dim)
+    exponent = -math.log(max_period) * torch.arange(start = 0, end = half_dim)
 
     # to spread the exponents evenly
-    exponent = exponent / (half_dim - downscale_freq_shift)
+    exponent = exponent / half_dim
 
     emb = torch.exp(exponent)
 
     # multiply the exponents with the timesteps
-    emb = emb[:, None] * timesteps[None, :] # to do matrix mat
+    emb = timesteps[:, None].float() * emb[None, :]  # to do matrix mat
 
     #concat sin and cos embeddings
-    emb = torch.cat([torch.sin(emb), torch.cos(emb)], dim = -1)
-
-    # flip to (cos, sin) if set to True
-    if flip_sin_cos:
-        emb = torch.cat([emb[:, half_dim:], emb[:, :half_dim]], dim = -1)
+    emb = torch.cat([torch.cos(emb), torch.sin(emb)], dim = -1)
 
     return emb
 
 class Timesteps(nn.Module):
-    def __init__(self, embed_dim: int):
+    def __init__(self):
         super().__init__()
-        self.embed_dim = embed_dim
     
     def forward(self, timesteps):
 
         time_embeddings = get_timestep_embeddings(
             timesteps = timesteps,
-            embed_dim = self.embed_dim
+            embed_dim = 256
         )
 
         return time_embeddings
 
 class CombinedTimestepTextProjEmbeddings(nn.Module):
-    def __init__(self, embed_dim: int):
+    def __init__(self):
         super().__init__()
 
-        self.time_proj = Timesteps(embed_dim)
+        self.time_proj = Timesteps()
         self.timestep_embedder = TimeStepEmbeddings()
         self.text_embedder = PixArtAlphaTextProjection()
 
     def forward(self, timestep, pooled_projection: Tensor) -> Tensor:
-
         timesteps_proj = self.time_proj(timestep)
         timesteps_emb = self.timestep_embedder(timesteps_proj.to(dtype=pooled_projection.dtype))  # (N, D)
 

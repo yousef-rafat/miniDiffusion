@@ -43,9 +43,7 @@ class DiTBlock(nn.Module):
                                              dropout = dropout_rate)
             
         self.ff = FeedForward(dim = embedding_size, dropout_rate = dropout_rate)
-
-        # for ff layer
-        #self.norm2 = nn.LayerNorm(embedding_size)
+        self.norm2 = nn.LayerNorm(embedding_size, elementwise_affine = False, eps = 1e-6)
 
         if not add_context_final:
             self.ff_context = FeedForward(dim = embedding_size, dropout_rate = dropout_rate)
@@ -64,13 +62,16 @@ class DiTBlock(nn.Module):
         # Normalize
         # /////////
 
-        norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(hidden_states, emb = time_emb)
+        if self.use_dual_attention:
+            norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp, norm_hidden_states2, gate_msa2 = self.norm1(hidden_states, embed = time_emb)
+        else:
+            norm_hidden_states, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.norm1(hidden_states, embed = time_emb)
         
         if self.final_context:
-            norm_hidden_states = self.norm1_context(encoder_hidden_states)
+            norm_encoder_hidden_states = self.norm1_context(encoder_hidden_states, cond_embed = time_emb)
         else:
             norm_encoder_hidden_states, c_gate_msa, c_shift_mlp, c_scale_mlp, c_gate_mlp = self.norm1_context(
-                encoder_hidden_states, emb = time_emb
+                encoder_hidden_states, embed = time_emb
             )
 
         ##############################################################################################################
@@ -79,7 +80,12 @@ class DiTBlock(nn.Module):
 
         # gated residual attention connection
         attn_output = gate_msa.unsqueeze(1) * attn_output
-        hidden_states += attn_output
+        hidden_states = hidden_states + attn_output
+
+        if self.use_dual_attention:
+            attn2_outputs = self.attn2(norm_hidden_states2) # forward attn pass
+            attn2_outputs = gate_msa2.unsqueeze(1) * attn2_outputs # gating
+            hidden_states = hidden_states + attn2_outputs # residual
 
         #########################################################################################################################
         # Feed Forward
@@ -93,7 +99,7 @@ class DiTBlock(nn.Module):
             ff_output = self.ff(norm_hidden_states)
 
         ff_output = gate_mlp.unsqueeze(1) * ff_output
-        hidden_states += ff_output
+        hidden_states = hidden_states + ff_output
 
         #############################################################################################################################
         # Fead Forward Context
@@ -122,7 +128,7 @@ class DiTBlock(nn.Module):
 # MultiModal Diffiusion Transformer Block (MMDiT)
 class DiT(nn.Module):
     # reference for rectified flow: https://arxiv.org/pdf/2403.03206
-    def __init__(self, heads: int = 64, embedding_size: int = 1536, patch_size: int = 1, depth: int = 24,
+    def __init__(self, heads: int = 24, embedding_size: int = 1536, patch_size: int = 2, depth: int = 24,
                  output_channels: int = 16, caption_projection_dim: int = 4096, dual_attention_layers: tuple = tuple(range(13))):
         super(DiT, self).__init__()
 
@@ -130,7 +136,7 @@ class DiT(nn.Module):
         # Create model layers
         #####################
 
-        self.time_text_embed = CombinedTimestepTextProjEmbeddings(embed_dim = embedding_size)
+        self.time_text_embed = CombinedTimestepTextProjEmbeddings()
         self.pos_embed = PatchEmbed(embedding_dim = embedding_size, patch_size = patch_size)
 
         self.context_embedder = nn.Linear(caption_projection_dim, embedding_size)
@@ -152,7 +158,7 @@ class DiT(nn.Module):
             ])
 
         self.norm_out = AdaLayerNormContinuous(embedding_size)
-        self.proj_out = nn.Linear(embedding_size, heads)
+        self.proj_out = nn.Linear(embedding_size, self.output_channels * patch_size * patch_size)
     
     def forward(self, latent: torch.Tensor, encoder_hidden_states: torch.Tensor, timestep: torch.LongTensor,
                 pooled_projections: torch.Tensor) -> torch.Tensor:
@@ -171,13 +177,13 @@ class DiT(nn.Module):
         # pass attention mask for every layer
         for layer in self.transformer_blocks:
 
-            hidden_states = layer(
+            hidden_states, encoder_hidden_states = layer(
                 hidden_states = hidden_states,
                 encoder_hidden_states = encoder_hidden_states,
-                time_embeddings = time_embeddings,
-                use_chunking = True
+                time_emb = time_embeddings,
+                use_chunking = False
             )
-
+            
         hidden_states = self.norm_out(hidden_states, time_embeddings)
         hidden_states = self.proj_out(hidden_states)
 
@@ -187,7 +193,7 @@ class DiT(nn.Module):
         height //= self.patch_size
         width //= self.patch_size
 
-        hidden_states.reshape(
+        hidden_states = hidden_states.reshape(
             shape = (hidden_states.size(0), height, width, self.patch_size, self.patch_size, self.output_channels)
         )
 
@@ -203,10 +209,10 @@ class DiT(nn.Module):
     
 def load_dit(dit: DiT) -> DiT:
 
-    DEBUG = True
+    DEBUG = False
 
     path = "d:\\encoders\\sd3"
-    missing, unexpected = dit.load_state_dict(torch.load(path), strict = False)
+    missing, unexpected = dit.load_state_dict(torch.load(path), strict = not DEBUG)
 
     if DEBUG:
         print(f"Missing keys ({len(missing)}):", missing)
@@ -217,17 +223,20 @@ def load_dit(dit: DiT) -> DiT:
     return dit
 
 def test_dit():
-    # TODO: fix the DiT testing
+
+    torch.manual_seed(2025)
+
     dit = DiT()
-    dit = load_dit(dit)
-    latent = torch.randn(1, 4, 28, 28)
+    #dit = load_dit(dit)
 
-    input_ids = torch.randint(50000, size = (1, 1024))
-    attention_mask = torch.zeros(input_ids.size(1)).unsqueeze(0)
+    # latent channels must be 16
+    latent = torch.randn(1, 16, 28, 28)
+    encoder_hidden_states = torch.randn(1, 77, 4096)
 
-    t = torch.rand(1, 1) # timestep for each batch
+    pooled_projection = torch.randn(1, 2048)
+    timestep = torch.tensor([500], dtype=torch.int64)
 
-    output = dit(latent = latent, input_ids = input_ids, attention_mask = attention_mask, t = t)
+    output = dit(latent = latent, encoder_hidden_states = encoder_hidden_states, pooled_projections = pooled_projection, timestep = timestep)
 
     print(output)
 
