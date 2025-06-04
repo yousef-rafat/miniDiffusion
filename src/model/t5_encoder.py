@@ -188,8 +188,8 @@ class T5EncoderModel(nn.Module):
         self.encoder.block = nn.ModuleList([T5Encoder(embed_dim, ff_dim = ff_dim, num_heads = num_heads, index = i) for i in range(12)])
         self.encoder.final_layer_norm = RMSNorm(embed_dim)
 
-        self.encoder.embed_tokens = nn.Embedding(vocab_size, embed_dim)
         self.shared = nn.Embedding(vocab_size, embed_dim)
+        self.encoder.embed_tokens = self.shared
 
     def forward(self, text, attn_mask: torch.Tensor):
 
@@ -230,13 +230,10 @@ def test_t5():
 
     from tokenizer import UnigramTokenizer
 
-    #tokenizer = UnigramTokenizer()
+    tokenizer = UnigramTokenizer()
 
-    #tokens = tokenizer.encode("a photo of a cat")
-    #tokens2 = tokenizer.encode("a photo of a house")
-    # 629
-    tokens = torch.tensor([3, 9, 1202, 13, 3, 9, 1782, 1])
-    tokens2 = torch.tensor([3, 9, 1202, 13, 3, 9, 1712, 1]) # cat
+    tokens = tokenizer.encode_ids("a photo of a cat")
+    tokens2 = tokenizer.encode_ids("a photo of a table")
 
     attn = torch.ones_like(tokens)
     attn2 = torch.ones_like(tokens2)

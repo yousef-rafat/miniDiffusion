@@ -198,13 +198,11 @@ class TorchTokenizer: # Byte-Level Byte-Pair Tokenizer
 
         return padded_ids, attention_mask
     
-SPIECE_UNDERLINE = "▁"
-
 class UnigramTokenizer: # For T5 Encoder
     def __init__(self, max_length: int = 77):
 
         # get from encoders/get_checkpoints.py
-        tokenizer_json_path = os.path.join(os.getcwd(), "encoders", "hub", "checkpoints", "t5_tokenizer", "tokenizer.json")
+        tokenizer_json_path = os.path.join(os.getcwd(), "encoders", "hub", "checkpoints", "t5_tokenizer", "spiece.model")
 
         self.spm_model = spm.SentencePieceProcessor()
         self.spm_model.Load(tokenizer_json_path)
@@ -214,67 +212,41 @@ class UnigramTokenizer: # For T5 Encoder
         # 3) Ensure an special token exists
         self.unk_token = '<unk>'
         self.pad_token = '<pad>'
+        self.eos_token = "</s>"
+
+        self.unk_token_length = len(self.spm_model.encode(str(self.unk_token)))
+
+    # convert a char piece to an integer
+    def _piece_to_id(self, piece: str) -> int:
+        return self.spm_model.piece_to_id(piece)
         
     def encode(self, text: str):
         """ Searches for the best way of splitting text by maximizing their probabilities """
 
         # replace spaces with SentencePiece's underline
-        text = text.replace(' ', '▁')
-        N = len(text)
+        tokens = self.spm_model.encode(text, out_type = str)
 
-        # B) DP arrays: dp[i]=best score to cover text[:i], prev[i]=split point
-        dp   = [float('inf')] * (N + 1)
-        prev = [0] * (N + 1)
-        dp[0] = 0
+        tokens = tokens + [self.eos_token]
 
-        # Viterbi forward pass
-        for i in range(1, N + 1):
-            j0 = max(0, i - self.max_piece_len)
-            for j in range(j0, i):
-                piece = text[j:i]
-                if piece in self.token_scores:
-                    sc = dp[j] + self.token_scores[piece]
-                    if sc < dp[i]:
-                        dp[i]   = sc
-                        prev[i] = j
-            # fallback to UNK if nothing matched
-            if dp[i] == float('inf'):
-                dp[i]   = dp[i-1] + self.token_scores[self.unk_token]
-                prev[i] = i - 1
-
-        # backtrace to recover pieces
-        pieces = []
-        i = N
-        while i > 0:
-            j = prev[i]
-            piece = text[j:i]
-            if piece not in self.token_scores:
-                piece = self.unk_token
-            pieces.append(piece)
-            i = j
-
-        pieces = pieces[::-1] # reverse list
-
-        # map to IDs
-        ids = [self.token_to_id.get(p, self.token_to_id[self.unk_token]) for p in pieces]
-
-        # truncate
-        if len(ids) >= self.max_length:
-            ids = ids[:self.max_length] 
-        else:
-            ids += [self.token_to_id[self.unk_token]] * (self.max_length - len(ids)) # pad
-
-        return torch.tensor(ids, dtype=torch.long)
+        if len(tokens) > self.max_length:
+            tokens = tokens[: self.max_length]
+        
+        return tokens
+    
+    def encode_ids(self, text):
+        tokens = self.encode(text)
+        ids = [self._piece_to_id(token) for token in tokens]
+        return torch.tensor(ids)
     
 def test_tokenizer():
     
-    text = "a photo of a dog"
+    text = "a photo of a cat"
 
     tokenizer = TorchTokenizer()
     token_ids = tokenizer.tokenize(text)
 
     tokenizer = UnigramTokenizer()
-    token_ids = tokenizer.encode(text)
+    token_ids = tokenizer.encode_ids(text)
 
     print("Tokenized:", token_ids) 
 
