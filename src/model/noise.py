@@ -45,7 +45,8 @@ class NoiseScheduler(torch.nn.Module):
             timesteps = sigmas * num_training_timesteps
 
             # add a zero at the end to reach the data distribution
-            self.sigmas = torch.cat([sigmas, torch.zeros(1, device = sigmas.device)])
+            self.sigmas = torch.cat([sigmas.flip(0), torch.zeros(1, device = sigmas.device)])
+            self.timesteps = timesteps.flip(0)
 
         self.step_index = 0
 
@@ -74,11 +75,7 @@ class NoiseScheduler(torch.nn.Module):
         sigma = sigma.view(tuple([sigma.size(0)] + [1] * (n_dim - 1)))
 
         return sigma
-    
-    def index_of_timestep(self, timestep):
-        indice = (self.timesteps == timestep).nonzero()
-        return indice[0].item()
-        
+            
     def sample_logit_timestep(self, batch_size: int = 1, device: str = "cpu") -> float:
         " Sample timesteps from logit normal distribution "
         # returns timesteps in range [0, timesteps - 1]
@@ -125,10 +122,6 @@ class NoiseScheduler(torch.nn.Module):
     def reverse_flow(self, current_sample: torch.Tensor, model_output: torch.FloatTensor, timestep: float, stochasticity: bool):
 
         """ Function to integerate the reverse process (eval mode) for a latent by solving ODE by Euler's method """
-
-        # when timestep is zero, the data has been reached
-        if timestep <= 0:
-            return current_sample
         
         # upcast to avoid precision errors
         current_sample = current_sample.to(torch.float32)

@@ -13,13 +13,13 @@ class HandlePrompt(nn.Module):
         self.clip_tokenizer = TorchTokenizer()
         self.t5_tokenizer = UnigramTokenizer()
     
-    def forward(self, x: torch.Tensor, clip: CLIP, clip_2: OpenCLIP, t5_encoder):
+    def forward(self, x: str, clip: CLIP, clip_2: OpenCLIP, t5_encoder):
 
         clip_tokens = self.clip_tokenizer.tokenize(x)
         t5_tokens = self.t5_tokenizer.encode(x)
 
-        clip_embeds, pooled = clip.encode_text(clip_tokens)
-        clip_2_embeds, pooled2 = clip_2.encode_text(clip_tokens)
+        pooled, clip_embeds = clip.encode_text(clip_tokens)
+        pooled2, clip_2_embeds = clip_2.encode_text(clip_tokens)
 
         t5_embeds = t5_encoder(t5_tokens)
 
@@ -27,10 +27,10 @@ class HandlePrompt(nn.Module):
 
         # get the difference between t5 and clip embeddings and pad it for it to become a matrix
         clip_embeddings = F.pad(
-            clip_embeddings, 0, t5_embeds.size(-1) - clip_embeddings.size(-1)
+            clip_embeddings, (0, t5_embeds.size(-1) - clip_embeddings.size(-1))
         )
 
-        embeddings = torch.cat([clip_embeds, t5_embeds], dim = -2)
+        embeddings = torch.cat([clip_embeddings, t5_embeds], dim = -2)
         pooled_embeddings = torch.cat([pooled, pooled2], dim = -1)
 
         return embeddings, pooled_embeddings
@@ -151,7 +151,7 @@ class FeedForward(nn.Module):
     
 class PatchEmbed(nn.Module):
     def __init__(self, in_channels: int = 16, embedding_dim: int = 2432, image_size: int = 384, patch_size: int = 16,
-                 pos_embed_max_size: int = 96):
+                 pos_embed_max_size: int = 384):
         super().__init__()
 
         self.proj = nn.Conv2d(in_channels, embedding_dim, kernel_size = 2, stride = 2)

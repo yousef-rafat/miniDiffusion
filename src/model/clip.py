@@ -27,7 +27,7 @@ class QuickGELU(nn.Module):
         return x * torch.sigmoid(1.702 * x)
     
 class TextEncoder(nn.Module):
-    def __init__(self, embed_dim: int = 768, depth: int = 12, num_heads: int = 12, max_seq_len: int = 77):
+    def __init__(self, act_fn: nn.Module, embed_dim: int = 768, depth: int = 12, num_heads: int = 12, max_seq_len: int = 77):
         super(TextEncoder, self).__init__()
 
         vocab_size = 49408
@@ -37,7 +37,7 @@ class TextEncoder(nn.Module):
         # tokenizer's context_length must be set to 77 tokens for CLIP to work
         self.embeddings.position_embedding = nn.Embedding(max_seq_len, embed_dim) # 77 = context length
 
-        self.encoder = Encoder(embed_size = embed_dim, depth = depth, num_heads = num_heads)
+        self.encoder = Encoder(act_fn = act_fn, embed_size = embed_dim, depth = depth, num_heads = num_heads)
 
         self.final_layer_norm = nn.LayerNorm(embed_dim)
 
@@ -124,12 +124,12 @@ class CLIPAttention(nn.Module):
         return output
     
 class MLP(nn.Module):
-    def __init__(self, embed_size, ratio = 4):
+    def __init__(self, embed_size, act_fn, ratio = 4):
         super().__init__()
 
         self.fc1 = nn.Linear(embed_size, embed_size * ratio)
         self.fc2 = nn.Linear(embed_size * ratio, embed_size)
-        self.gelu = QuickGELU()
+        self.gelu = act_fn()
 
     def forward(self, x: torch.Tensor):
 
@@ -140,12 +140,12 @@ class MLP(nn.Module):
         return x
     
 class EncoderLayer(nn.Module):
-    def __init__(self, embed_size: int = 768, ratio: int = 4, num_heads: int = 12):
+    def __init__(self, act_fn: nn.Module, embed_size: int = 768, ratio: int = 4, num_heads: int = 12):
         super().__init__()
 
         self.layer_norm1 = nn.LayerNorm(embed_size)
         self.layer_norm2 = nn.LayerNorm(embed_size)
-        self.mlp = MLP(embed_size = embed_size, ratio = ratio)
+        self.mlp = MLP(embed_size = embed_size, act_fn = act_fn, ratio = ratio)
 
         self.self_attn = CLIPAttention(num_heads = num_heads, embed_dim = embed_size)
 
@@ -167,10 +167,10 @@ class EncoderLayer(nn.Module):
         return x
 
 class Encoder(nn.Module):
-    def __init__(self, embed_size = 768, depth: int = 12, num_heads: int = 12):
+    def __init__(self, act_fn: nn.Module, embed_size = 768, depth: int = 12, num_heads: int = 12):
         super().__init__()
 
-        self.layers = nn.ModuleList([EncoderLayer(embed_size = embed_size, num_heads = num_heads) for _ in range(depth)])
+        self.layers = nn.ModuleList([EncoderLayer(act_fn = act_fn, embed_size = embed_size, num_heads = num_heads) for _ in range(depth)])
 
     def forward(self, hidden_states: torch.Tensor, attention_mask = None, causal_mask = None, return_pentlum: bool = False):
 
@@ -189,11 +189,11 @@ class Encoder(nn.Module):
         else: return hidden_states
 
 class CLIP(nn.Module):
-    def __init__(self, embed_dim: int = 768, depth: int = 12, num_heads: int = 12):
+    def __init__(self, embed_dim: int = 768, act_fn: nn.Module = QuickGELU, depth: int = 12, num_heads: int = 12):
         super(CLIP, self).__init__()
 
         self.tokenizer = TorchTokenizer()
-        self.text_model = TextEncoder(embed_dim = embed_dim, depth = depth, num_heads = num_heads,
+        self.text_model = TextEncoder(embed_dim = embed_dim, act_fn = act_fn, depth = depth, num_heads = num_heads,
                                       max_seq_len = self.tokenizer.max_length)
                 
         self.text_projection = nn.Linear(embed_dim, embed_dim, bias = False)
@@ -208,8 +208,7 @@ class CLIP(nn.Module):
         # tokenize strings if raw text passed
         if attention_mask is None:
             input_ids, attention_mask = self.tokenizer.tokenize_batch([input_ids])
-        print(input_ids)
-        print(attention_mask)
+
         # ensure batch dim
         if input_ids.dim() == 1:
             input_ids = input_ids.unsqueeze(0)
@@ -225,7 +224,7 @@ class CLIP(nn.Module):
 
 class OpenCLIP(CLIP):
     def __init__(self):
-        super().__init__(embed_dim = 1280, depth = 32, num_heads = 16)
+        super().__init__(embed_dim = 1280, depth = 32, num_heads = 16, act_fn = nn.GELU)
 
 def load_clip(model: CLIP, model_2: OpenCLIP, device = "cpu"):
 
@@ -234,13 +233,10 @@ def load_clip(model: CLIP, model_2: OpenCLIP, device = "cpu"):
     # checkpoints could be installed automatically from encoders/get_checkpoints.py
 
     clip_path = os.path.join(os.getcwd(), "encoders", "hub", "checkpoints", "clip_model.pth")
-    model.load_state_dict(torch.load(clip_path, map_location = device), strict = True)
+    model.load_state_dict(torch.load(clip_path, map_location = device), strict = not DEBUG)
 
-    path = "d:\\encoders\\clip_2_saved\\saved.pth"
-    path2 = "d:\\encoders\\clip_2\\models--laion--CLIP-ViT-bigG-14-laion2B-39B-b160k\\snapshots\\743c27bd53dfe508a0ade0f50698f99b39d03bec\\pytorch_model-00002-of-00002.bin"
-
-    #missing, unexpected = model_2.load_state_dict(torch.load(path, map_location = device), strict = False)
-    #missing2, unexpected2 = model_2.load_state_dict(torch.load(path2, map_location = device), strict = False)
+    path = os.path.join(os.getcwd(), "encoders", "hub", "checkpoints", "clip.pth")
+    missing, unexpected = model_2.load_state_dict(torch.load(path, map_location = device), strict = not DEBUG)
     
     # for debuggging
     if DEBUG:
@@ -259,8 +255,14 @@ def test_clip():
 
     model, model_2 = load_clip(model, model_2)
 
-    ids, _ = model.encode_text("a photo of a cat")
-    ids2, _ = model.encode_text("a photo of a dog")
+    ids, pooled = model.encode_text("a photo of a cat")
+    ids2, _ = model.encode_text("a photo of a house")
+
+    print(pooled.mean(), pooled.std())
+    print(pooled)
+
+    print(ids.size())
+    print(pooled.size())
 
     from torch.nn.functional import cosine_similarity
     print("cosine cat/dog:", cosine_similarity(ids, ids2, dim=-1).item())

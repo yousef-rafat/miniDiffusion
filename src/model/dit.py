@@ -109,7 +109,7 @@ class DiTBlock(nn.Module):
         else:
             # apply attention mechanisim
             encoder_output = c_gate_msa.unsqueeze(1) * encoder_output
-            encoder_hidden_states += encoder_output
+            encoder_hidden_states = encoder_hidden_states + encoder_output
 
             # normalize and (shift and scale)
             norm_encoder_hidden_states = self.norm2_context(encoder_hidden_states)
@@ -227,7 +227,7 @@ def test_dit():
     torch.manual_seed(2025)
 
     dit = DiT()
-    #dit = load_dit(dit)
+    dit = load_dit(dit)
 
     # latent channels must be 16
     latent = torch.randn(1, 16, 28, 28)

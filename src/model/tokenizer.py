@@ -185,7 +185,7 @@ class TorchTokenizer: # Byte-Level Byte-Pair Tokenizer
 
         " Dynamic padding "
 
-        input_ids = [torch.tensor(self.tokenize(text), dtype = torch.long) for text in texts]
+        input_ids = [self.tokenize(text) for text in texts]
 
         padded_ids = pad_sequence(input_ids, batch_first = True, padding_value = self.pad_id)
 

@@ -59,10 +59,10 @@ class AttentionBlock(nn.Module):
         super().__init__()
 
         self.group_norm = nn.GroupNorm(32, channels)
-        self.query = nn.Linear(channels, channels)
-        self.key = nn.Linear(channels, channels)
-        self.value = nn.Linear(channels, channels)
-        self.proj_attn = nn.Linear(channels, channels)
+        self.to_q = nn.Linear(channels, channels)
+        self.to_k = nn.Linear(channels, channels)
+        self.to_v = nn.Linear(channels, channels)
+        self.to_out = nn.ModuleList([nn.Linear(channels, channels)])
 
     def forward(self, x: torch.Tensor):
         
@@ -73,9 +73,9 @@ class AttentionBlock(nn.Module):
         h = h.view(B, H * W, C)
 
         # forward
-        query = self.query(h)
-        key = self.key(h)
-        value = self.value(h)
+        query = self.to_q(h)
+        key = self.to_k(h)
+        value = self.to_v(h)
 
         # resizing
         query = query.view(B, C, H * W)
@@ -88,7 +88,7 @@ class AttentionBlock(nn.Module):
         out = torch.bmm(value, attn.transpose(1, 2))
 
         # project and return
-        out = self.proj_attn(out.transpose(1, 2))
+        out = self.to_out[0](out.transpose(1, 2))
         out = out.view(B, C, H, W)
 
         return out + x
@@ -102,16 +102,17 @@ class DiagonalGaussianDistribution:
 
         # divide quant channels (8) into mean and log variance
         self.latent_channels = latent_channels
-        self.mu = params[:, :latent_channels, :, :]
-        self.logvar = params[:, latent_channels:latent_channels * 2, :, :]
+        self.mean, self.logvar = torch.chunk(params, 2, dim = 1)
+
+        self.logvar = torch.clamp(self.logvar, -30.0, 20.0)
+        self.std = torch.exp(0.5 * self.logvar)
 
     def sample(self):
-        std = torch.exp(0.5 * self.logvar)
-        eps = torch.randn_like(std)
 
-        z = self.mu + eps * std
+        eps = torch.randn_like(self.std)
+        z = self.mean + eps * self.std
 
-        return z * 0.18215
+        return z
 
 # ///////////////////////
 # Samplers /////////////
@@ -210,8 +211,24 @@ class UpBlock(nn.Module):
 
         return x
     
+class MidBlock(nn.Module):
+    def __init__(self, channels):
+        super().__init__()
+        self.attentions = nn.ModuleList([AttentionBlock(channels)])
+        self.resnets = nn.ModuleList([ResnetBlock(channels), ResnetBlock(channels)])
+
+    def forward(self, hidden_states):
+        
+        hidden_states = self.resnets[0](hidden_states)
+        for attn, resnet in zip(self.attentions, self.resnets[1:]):
+
+            hidden_states = attn(hidden_states)
+            hidden_states = resnet(hidden_states)
+
+        return hidden_states
+    
 class Encoder(nn.Module):
-    def __init__(self, in_channels = 3, base_channels = 128, quant_channels = 8):
+    def __init__(self, in_channels = 3, base_channels = 128, quant_channels = 32):
         super().__init__()
 
         # ////////////////////
@@ -239,14 +256,8 @@ class Encoder(nn.Module):
             self.down_blocks.append(DownBlock(in_ch, out_ch, use_conv))
             channels = out_ch
 
-        attentions = nn.ModuleList([AttentionBlock(channels)])
-        resnets = nn.ModuleList([ResnetBlock(channels), ResnetBlock(channels)])
-
         # expected key "encoder.mid_block"
-        self.mid_block = nn.ModuleDict({
-            "resnets": resnets,
-            "attentions": attentions
-        })
+        self.mid_block = MidBlock(channels)
 
         # normalization and conv layer
         self.conv_norm_out = nn.GroupNorm(num_groups = 32, num_channels = channels)
@@ -262,12 +273,7 @@ class Encoder(nn.Module):
             h = layer(h)
         
         # apply mid block
-        for layer in self.mid_block["resnets"]:
-            h = layer(h)
-
-        for layer in self.mid_block["attentions"]:
-            h = layer(h)
-
+        h = self.mid_block(h)
         h = self.conv_norm_out(h)
         h = self.conv_act(h)
         h = self.conv_out(h)
@@ -289,15 +295,8 @@ class Decoder(nn.Module):
         channels = base_channels * (num_up ** 2)
 
         # middle
-        attentions = nn.ModuleList([AttentionBlock(channels)])
-        resnets = nn.ModuleList([ResnetBlock(channels), ResnetBlock(channels)])
-
-        # expected key "decoder.mid_block"
-        self.mid_block = nn.ModuleDict({
-            "resnets": resnets,
-            "attentions": attentions
-        })
-
+        self.mid_block = MidBlock(channels)
+        
         up_config = [
             (512, 512, True),
             (512, 512, True),
@@ -319,11 +318,7 @@ class Decoder(nn.Module):
         h = self.conv_in(x)
 
         # apply mid block
-        for layer in self.mid_block["resnets"]:
-            h = layer(h)
-
-        for layer in self.mid_block["attentions"]:
-            h = layer(h)
+        h = self.mid_block(h)
 
         for layer in self.up_blocks:
             h = layer(h)
@@ -336,7 +331,7 @@ class Decoder(nn.Module):
 class VAE(nn.Module):
     # Create the variational autoencoder
     #                  RGB                 dim. of latent space  1st layers channels  no. of channels after bottleneck 
-    def __init__(self, input_channels = 3, latent_channels = 4, base_channels = 128, quant_channels = 8):
+    def __init__(self, input_channels = 3, latent_channels = 16, base_channels = 128, quant_channels = 32):
         """
         Args:
             depth (int): Number of downsampling (and upsampling) blocks.
@@ -345,17 +340,14 @@ class VAE(nn.Module):
         super(VAE, self).__init__()
 
         self.latent_channels = latent_channels
+        self.shift_factor = 0.0609
+        self.scaling_factor = 1.5305
+        self.vae_scale_factor = 8
 
         self.encoder = Encoder(
             in_channels = input_channels, base_channels = base_channels,
             quant_channels = quant_channels
         )
-
-        # map encoder output to quant_channels (8)
-        self.quant_conv = nn.Conv2d(quant_channels, quant_channels, kernel_size = 1)
-
-        # map decoder output to decoder latent channels (4)
-        self.post_quant_conv = nn.Conv2d(latent_channels, latent_channels, kernel_size = 1)
 
         self.decoder = Decoder(
             latent_channels = latent_channels, base_channels = base_channels,
@@ -367,16 +359,12 @@ class VAE(nn.Module):
     def encode(self, x):
 
         h = self.encoder(x)
-        h = self.quant_conv(h)
 
         latent_dist = DiagonalGaussianDistribution(params = h, latent_channels = self.latent_channels)
 
         return latent_dist
 
     def decode(self, z):
-
-        z = (1 / 0.18215) * z
-        z = self.post_quant_conv(z)
 
         decoded =  self.decoder(z)
         decoded = self.resizer(decoded)
@@ -388,14 +376,16 @@ def load_vae(model: VAE, device: str = "cpu") -> VAE:
 
     # checkpoints could be installed automatically from encoders/get_checkpoints.py
 
+    DEBUG = False
+
     import os
-    path = os.path.join(os.getcwd(), os.path.join("encoders", "hub", "checkpoints", "vae_checkpoint.pth"))
+    path = os.path.join(os.getcwd(), os.path.join("encoders", "hub", "checkpoints", "vae.pth"))
 
     checkpoint = torch.load(path, map_location = device)
-    missing, unexpected = model.load_state_dict(checkpoint, strict = True)
+    missing, unexpected = model.load_state_dict(checkpoint, strict = not DEBUG)
 
     # for debuggging
-    if len(missing) != 0:
+    if DEBUG:
         print(f"Missing keys ({len(missing)}):", missing)
         print(f"\nUnexpected keys ({len(unexpected)}):", unexpected)
 

@@ -180,12 +180,12 @@ class T5Encoder(nn.Module):
         return x, position_bias
 
 class T5EncoderModel(nn.Module):
-    def __init__(self, embed_dim: int = 768, num_heads: int = 12, ff_dim: int = 2048):
+    def __init__(self, embed_dim: int = 4096, num_heads: int = 64, ff_dim: int = 10240, depth: int = 24):
         super().__init__()
         vocab_size = 32128
 
         self.encoder = nn.Module()
-        self.encoder.block = nn.ModuleList([T5Encoder(embed_dim, ff_dim = ff_dim, num_heads = num_heads, index = i) for i in range(12)])
+        self.encoder.block = nn.ModuleList([T5Encoder(embed_dim, ff_dim = ff_dim, num_heads = num_heads, index = i) for i in range(depth)])
         self.encoder.final_layer_norm = RMSNorm(embed_dim)
 
         self.shared = nn.Embedding(vocab_size, embed_dim)
@@ -213,7 +213,7 @@ class T5EncoderModel(nn.Module):
 
 def load_t5(model: T5EncoderModel, device: str = "cpu") -> T5EncoderModel:
 
-    checkpoint = os.path.join(os.getcwd(), "encoders", "hub", "checkpoints", "t5_encoder.pth")
+    checkpoint = "d:\\test\\t5_model.pt"
     missing, unexpected = model.load_state_dict(torch.load(checkpoint), strict = True)
     model = model.to(device)
 

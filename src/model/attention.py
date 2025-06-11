@@ -3,6 +3,8 @@ import torch.nn as nn
 from collections import deque
 import torch.nn.functional as F
 from dit_components import RMSNorm
+
+# TODO: REVIST THE PAGIN LOGIC
 class PagedJointAttention(nn.Module):
     def __init__(self, heads: int, embedding_size: int, dropout: float = 0.1, page_size: int = 512, max_pages: int = 16,
                  add_q_context: bool = None, add_kv_proj: bool = False):
