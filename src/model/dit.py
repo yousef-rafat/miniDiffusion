@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
-from attention import PagedJointAttention
-from dit_components import ( 
+from model.attention import PagedJointAttention
+from model.dit_components import ( 
     CombinedTimestepTextProjEmbeddings, PatchEmbed, AdaLayerNormContinuous, AdaLayerNormZero,
     FeedForward, AdaLayerNormZeroX, chunk_feed_forward
 )
@@ -209,10 +209,12 @@ class DiT(nn.Module):
     
 def load_dit(dit: DiT) -> DiT:
 
+    import os
+
     DEBUG = False
 
-    path = "d:\\encoders\\sd3"
-    missing, unexpected = dit.load_state_dict(torch.load(path), strict = not DEBUG)
+    checkpoint = os.path.join(os.getcwd(), "encoders", "hub", "checkpoints", "sd3_diff.pth")
+    missing, unexpected = dit.load_state_dict(torch.load(checkpoint), strict = not DEBUG)
 
     if DEBUG:
         print(f"Missing keys ({len(missing)}):", missing)

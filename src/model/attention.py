@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 from collections import deque
 import torch.nn.functional as F
-from dit_components import RMSNorm
+from model.dit_components import RMSNorm
 
 # TODO: REVIST THE PAGIN LOGIC
 class PagedJointAttention(nn.Module):

@@ -17,7 +17,8 @@ effects = v2.Compose([
     v2.RandomHorizontalFlip(),
     v2.RandomPerspective(distortion_scale = 0.4, p = 0.6),
     v2.Resize(size = (384, 384)), # for vae
-    ToTensor()
+    ToTensor(),
+    v2.Lambda(lambda t: t * 2 - 1) # from [0, 1] to [-1, 1]
 ])
 
 class OptimizeImage(nn.Module):

@@ -3,8 +3,8 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 import torch.nn.functional as F
-from clip import CLIP, OpenCLIP
-from tokenizer import TorchTokenizer, UnigramTokenizer
+from model.clip import CLIP, OpenCLIP
+from model.tokenizer import TorchTokenizer, UnigramTokenizer
 
 class HandlePrompt(nn.Module):
     def __init__(self):

@@ -19,6 +19,7 @@ def train(device: Optional[str], train_dataset: Optional[str], epochs: int = 3, 
     model = DiT().to(device = device)
 
     torch.set_default_dtype(torch.bfloat16)
+    torch.set_default_device(device)
     torch.manual_seed(2025)
 
     # turn fused only on when gpu is available
@@ -132,7 +133,6 @@ def get_args():
 
     parser.add_argument("--device", type = str, choices=["cpu", "cuda"], default = "cpu", help = "Device to use (cpu or cuda)")
     parser.add_argument("--train_dataset", type = str, required = False, help = "Path to the training dataset")
-    parser.add_argument("--eval_dataset", type = str, required = False, help = "Path to the evaluation dataset")
     parser.add_argument("--epochs", type = int, default = 5, help = "Number of training epochs")
     parser.add_argument("--lr", type = float, default = 0.003, help = "Learning rate")
     parser.add_argument("--batch_size", type = int, default = 4, help = "Batch size for training")
@@ -146,7 +146,6 @@ if __name__ == "__main__":
     train(
         device = args.device,
         train_dataset = args.train_dataset,
-        eval_dataset = args.eval_dataset,
         epochs = args.epochs,
         lr = args.lr,
         batch_size = args.batch_size,

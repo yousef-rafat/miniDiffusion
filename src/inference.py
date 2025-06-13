@@ -20,11 +20,12 @@ def inference(prompt: str, num_inference_steps: int = 50, device: str = "cpu"):
 
     model = DiT().eval()
 
-    model_path = os.path.exists(os.getcwd(), "model", "checkpoint.pth")
+    model_path = os.path.exists(os.path.join(os.getcwd(), "model", "checkpoint.pth"))
 
     if model_path:
         model = model.load_state_dict(model_path)
     else:
+        print("loading dit")
         model = load_dit(model)
 
     clip = CLIP()
@@ -37,15 +38,16 @@ def inference(prompt: str, num_inference_steps: int = 50, device: str = "cpu"):
 
     timesteps = noiser.timesteps
 
-    clip = load_clip(clip = clip, clip_2 = clip_2, device = device)
-    t5_encoder = load_t5(model = t5_encoder, device = device)
-
-    checkpoint_path = os.path.join(os.getcwd(), "model", "checkpoint")
-    model.load_state_dict(checkpoint_path)
+    if prompt is not None:
+        clip = load_clip(clip = clip, clip_2 = clip_2, device = device)
+        t5_encoder = load_t5(model = t5_encoder, device = device)
+        embeddings, pooled_projections = prompt_handler(prompt, clip = clip, clip_2 = clip_2, t5_encoder = t5_encoder)
+    else:
+        embeddings = torch.zeros(1, 77, 4096).to(device)
+        pooled_projections = torch.zeros(1, 2048).to(device)
 
     latent = torch.randn(1, 16, 48, 48, device = model.device)  # initial latent space
 
-    embeddings, pooled_projections = prompt_handler(prompt, clip = clip, clip_2 = clip_2, t5_encoder = t5_encoder)
     timesteps = noiser.timesteps
 
     # inference loop
@@ -56,7 +58,7 @@ def inference(prompt: str, num_inference_steps: int = 50, device: str = "cpu"):
 
             outputs = model(latent, encoder_hidden_states = embeddings, pooled_projections = pooled_projections, timestep = timestep)
 
-            latent = noiser.reverse_flow(current_sample = latent, model_output = outputs, timestep = timestep, stochasticity = False)
+            latent = noiser.reverse_flow(current_sample = latent, model_output = outputs, stochasticity = False)
 
     
     latent = (latent / vae.scaling_factor) + vae.shift_factor

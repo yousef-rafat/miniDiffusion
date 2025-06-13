@@ -119,7 +119,7 @@ class NoiseScheduler(torch.nn.Module):
         return noised_image, noise, timestep
     
     @torch.no_grad()
-    def reverse_flow(self, current_sample: torch.Tensor, model_output: torch.FloatTensor, timestep: float, stochasticity: bool):
+    def reverse_flow(self, current_sample: torch.Tensor, model_output: torch.FloatTensor, stochasticity: bool):
 
         """ Function to integerate the reverse process (eval mode) for a latent by solving ODE by Euler's method """
         

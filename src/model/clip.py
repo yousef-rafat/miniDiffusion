@@ -4,7 +4,7 @@ import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from tokenizer import TorchTokenizer
+from model.tokenizer import TorchTokenizer
 
 def create_causal_mask(input_shape, device: str = "cpu"):
     
@@ -235,7 +235,7 @@ def load_clip(model: CLIP, model_2: OpenCLIP, device = "cpu"):
     clip_path = os.path.join(os.getcwd(), "encoders", "hub", "checkpoints", "clip_model.pth")
     model.load_state_dict(torch.load(clip_path, map_location = device), strict = not DEBUG)
 
-    path = os.path.join(os.getcwd(), "encoders", "hub", "checkpoints", "clip.pth")
+    path = os.path.join(os.getcwd(), "encoders", "hub", "checkpoints", "clip2.pth")
     missing, unexpected = model_2.load_state_dict(torch.load(path, map_location = device), strict = not DEBUG)
     
     # for debuggging

@@ -5,7 +5,7 @@ import math
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from dit_components import RMSNorm
+from model.dit_components import RMSNorm
     
 class DenseRelu(nn.Module):
     """ T5 feed-forward with gating: wo(GELU(wi_0(x)) * wi_1(x)) """
@@ -213,7 +213,7 @@ class T5EncoderModel(nn.Module):
 
 def load_t5(model: T5EncoderModel, device: str = "cpu") -> T5EncoderModel:
 
-    checkpoint = "d:\\test\\t5_model.pt"
+    checkpoint = os.path.join(os.getcwd(), "encoders", "hub", "checkpoints", "t5_encoder.pth")
     missing, unexpected = model.load_state_dict(torch.load(checkpoint), strict = True)
     model = model.to(device)
 
